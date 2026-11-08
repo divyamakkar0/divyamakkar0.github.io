@@ -1,0 +1,202 @@
+/* ---------- tokens ---------- */
+
+:root {
+    --bg: #f6f5f2;
+    --fg: #0a0a0a;
+    --muted: #737373;
+    --rule: #0a0a0a1a;
+    --link: #0b7a3b;
+    --link-hover: #085c2c;
+
+    --col: 28em;
+    --date-col: 8em;
+}
+
+/* ---------- general page rules ---------- */
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 17px;
+    font-weight: 400;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---------- layout ---------- */
+
+#holder {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    /* pack wrapped lines at the top: min-height would otherwise spread them
+       down the full viewport, pushing the post list far below the tabs */
+    align-content: flex-start;
+    justify-content: space-between;
+    gap: 1.5rem 3rem;
+
+    min-height: 100vh;
+    min-height: 100svh;
+    padding: clamp(2rem, 6vh, 3.5rem) clamp(1.5rem, 4vw, 3rem);
+}
+
+/* ---------- tabs ---------- */
+
+#tabs {
+    display: flex;
+    gap: 1.5rem;
+    flex: 0 0 auto;
+    /* centres the tabs on the name's vertical middle. A fixed offset rather
+       than a flexbox alignment, because pages without a name (More) would
+       otherwise have nothing to align to and the tabs would jump. */
+    padding-top: 7px;
+}
+
+#tabs a {
+    color: var(--muted);
+    background-image: none;
+    padding-bottom: 0;
+}
+
+/* no underline, so colour alone marks the current tab */
+#tabs a:hover,
+#tabs a.is-current {
+    color: var(--fg);
+}
+
+/* ---------- text column ---------- */
+
+#middle {
+    flex: 1 1 var(--col);
+    max-width: var(--col);
+    margin-left: auto;
+    text-align: right;
+}
+
+/* pages that read left-to-right (the post index) drop below the tabs
+   and take the full width instead of hugging the right edge */
+#middle.is-left {
+    /* max-width must stay off the flex item itself: it would clamp the
+       hypothetical main size and the item would never wrap below the tabs */
+    flex-basis: 100%;
+    max-width: none;
+    margin-left: 0;
+    margin-top: 0;
+    text-align: left;
+}
+
+h1 {
+    margin: 0 0 1.75rem;
+    font-family: "Newsreader", Georgia, "Times New Roman", serif;
+    font-size: 2.35rem;
+    font-weight: 400;
+    line-height: 1.1;
+    letter-spacing: -0.015em;
+}
+
+p {
+    margin: 0 0 1.35rem;
+    text-wrap: pretty;
+}
+
+p:last-child {
+    margin-bottom: 0;
+}
+
+/* ---------- post index ---------- */
+
+.posts {
+    margin: 0;
+    padding: 0;
+    max-width: 52em;
+    list-style: none;
+    border-top: 1px solid var(--rule);
+}
+
+/* fixed date column so every title starts at the same x */
+.posts > li {
+    display: grid;
+    grid-template-columns: var(--date-col) minmax(0, 1fr);
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--rule);
+}
+
+.date {
+    color: var(--fg);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* this page uses the plain browser link effect, not the underline above:
+   black at rest, green on hover */
+.posts a {
+    color: var(--fg);
+    text-decoration: underline;
+    background-image: none;
+    padding-bottom: 0;
+}
+
+.posts a:hover {
+    color: var(--link);
+}
+
+/* the small triangle sub-item under a post */
+.sub {
+    margin: 0.1rem 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.sub li {
+    font-size: 0.85em;
+    line-height: 1.55;
+}
+
+.sub li::before {
+    content: "\25B8";
+    margin-right: 0.35rem;
+    color: var(--fg);
+}
+
+/* ---------- links ---------- */
+
+a {
+    color: var(--link);
+    text-decoration: none;
+    background-image: linear-gradient(currentColor, currentColor);
+    background-repeat: no-repeat;
+    background-position: 0 100%;
+    background-size: 100% 1px;
+    padding-bottom: 1px;
+    transition: color 120ms ease, background-size 160ms ease;
+}
+
+a:hover {
+    color: var(--link-hover);
+    background-size: 100% 2px;
+}
+
+a:focus-visible {
+    outline: 2px solid var(--link);
+    outline-offset: 3px;
+    border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    a {
+        transition: none;
+    }
+}

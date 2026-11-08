@@ -1,0 +1,1961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-4QH3NNEJDL"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+    gtag('js', new Date());
+
+    gtag('config', 'G-4QH3NNEJDL');
+  </script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Async RL in Pure JAX</title>
+  <meta name="description" content="Async RL in JAX">
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Async RL in Pure JAX">
+  <meta property="og:description" content="Async RL in JAX">
+  <meta property="og:url" content="https://divyamakkar0.github.io/scaling-async-rl.html">
+  <meta property="og:image" content="https://divyamakkar0.github.io/images/async_rl_preview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Async RL in Pure JAX">
+  <meta name="twitter:description" content="Async RL in JAX">
+  <meta name="twitter:image" content="https://divyamakkar0.github.io/images/async_rl_preview.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap">
+  <link rel="stylesheet" href="post.css?v=4">
+  <script>
+    MathJax = { tex: { inlineMath: [['$', '$']], displayMath: [['$$', '$$']] } };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>document.addEventListener("DOMContentLoaded", function () { hljs.highlightAll(); });</script>
+</head>
+<body class="post">
+  <div id="holder">
+    <div id="left"></div>
+    <div id="middle" class="wide">
+
+    <nav>
+      <a href="index.html">About</a>
+      <a href="more.html">More</a>
+    </nav>
+
+    <a class="back-link" href="more.html">&larr; Back</a>
+
+    <div class="post-header">
+      <h1>Async RL in Pure JAX</h1>
+      <div class="post-meta">September 7, 2026</div>
+      <div class="post-meta"><i>Written in collaboration with <a href="https://adityamakkar000.github.io/index.html" style="text-decoration: underline;">Aditya Makkar</a></i></div>
+    </div>
+
+    <div class="post-body">
+
+      <p>
+        Scaling RL has become the core approach in unlocking the capabilities of many frontier models today. Thinking beyond current RLVR recipes potentially requires changes across different actors within the stack. Existing frameworks such as <a href="https://github.com/google/tunix">Tunix</a> are great for production level RLVR; however, for experimentation, they are quite heavy and require Pathways to scale RL on TPUs. To make this experimentation easier, we introduce a lightweight, performant asynchronous RL stack in pure JAX. We share a work log alongside a few engineering insights we've seen along the way.
+      </p>
+
+      <p>
+        Code: <a href="https://github.com/adityamakkar000/asyncRL">github.com/adityamakkar000/asyncRL</a>
+      </p>
+
+      <p>
+        Special thanks to the TRC program, especially Zak, for the TPU support!
+      </p>
+
+      <h2 id="contents">Contents</h2>
+
+      <div class="toc">
+        <ul>
+          <li><a href="#async-design">Async Design</a>
+          </li>
+          <li><a href="#inference">Inference</a>
+            <ul>
+              <li><a href="#prefill">Prefill</a></li>
+              <li><a href="#decode">Decode</a></li>
+              <li><a href="#continuous-batching">Continuous Batching</a></li>
+              <li><a href="#end-to-end-generation">End To End Generation</a></li>
+              <li><a href="#scaling-replicas">Scaling Replicas</a></li>
+              <li><a href="#optional-scaling-replicas-with-spmd">Optional: Scaling Replicas with SPMD</a></li>
+            </ul>
+          </li>
+          <li><a href="#trainer">Trainer</a>
+            <ul>
+              <li><a href="#train-loop">Train Loop</a></li>
+              <li><a href="#samples">Samples</a></li>
+              <li><a href="#shardings">Shardings</a></li>
+              <li><a href="#loss-function">Loss Function</a></li>
+              <li><a href="#memory-optimization">Memory Optimization</a></li>
+              <li><a href="#weight-sync">Weight Sync</a></li>
+              <li><a href="#roofline-analysis">Roofline Analysis</a></li>
+            </ul>
+          </li>
+          <li><a href="#results">Results</a>
+          </li>
+          <li><a href="#conclusion">Conclusion</a>
+          </li>
+          <li><a href="#acknowledgements">Acknowledgements</a>
+          </li>
+        </ul>
+      </div>
+
+      <h2 id="async-design">Async Design</h2>
+
+      <p>
+        Following traditional policy-gradient methods, early RLVR experiments followed a synchronous process alternating between training and generation <a class="cite" href="#ref-1">[1]</a>. This synchrony introduces the straggler problem. Suppose for each of the $P$ prompts, $G$ samples are generated for a total of $PG$ sequences. If the inference engine can decode at most $S < PG$ sequences concurrently, the generation is split across multiple batches. With continuous batching, the accelerators can be fully utilized for intermediate batches, but the last in-flight decode batch would result in some idle compute. How inefficient is this in practice? PipelineRL reports ~10% at large batch sizes <a class="cite" href="#ref-2">[2]</a>.
+      </p>
+
+      <figure>
+        <img src="images/pipelinerl_fig2b.png?v=2" alt="Number of in-flight sequences over time for inference batch sizes from 128 to 1024, showing each batch draining towards the end of generation">
+        <figcaption>Figure 2 in the PipelineRL paper <a class="cite" href="#ref-2">[2]</a> showcases how full each in-flight batch is from the start of generation.</figcaption>
+      </figure>
+
+      <p>
+        PipelineRL proposes a natural solution to the straggler problem called AsyncRL, which disaggregates the accelerators to be either train or inference workers running in parallel.
+      </p>
+
+      <p>
+        Using an async multi-actor system for RL is not a new idea, <a href="https://arxiv.org/abs/1602.01783"><i>Asynchronous Methods for Deep Reinforcement Learning</i></a> was released 10 years ago<sup class="fn" id="fnref-1"><a href="#fn-1">1</a></sup>. What has changed over the past few years is the scale of RL. Modern-day RLVR systems coordinate hundreds to thousands of accelerators in a multi-actor system which contrasts against the <a href="https://jaxformer.com/">traditional SPMD paradigm used to scale pretraining</a> <a class="cite" href="#ref-3">[3</a>, <a class="cite" href="#ref-4">4]</a>.
+      </p>
+
+      <p>
+        There are a few axes that differentiate async RL frameworks <a class="cite" href="#ref-5">[5]</a>. A major one is the coordination between the actors in the system: the trainer which performs the gradient update (implemented as the <code>AsyncTrainWorker</code>) and the inference engine which rolls out with the current policy (implemented as the <code>AsyncInferenceWorker</code>).
+      </p>
+
+      <p>
+        The first question that arises is how should the train and inference workers be allocated. There are two main approaches to this. The first is allocating a single node and splitting the hosts. For example, suppose we allocate a <code>TPU-v5p-32</code><sup class="fn" id="fnref-2"><a href="#fn-2">2</a></sup> which has 4 devices per host, for a total of 4 hosts. The hosts can be split such that each host becomes either a train or inference worker.
+      </p>
+
+      <figure>
+        <img src="images/tpu_v5p_32_split.png?v=2" style="max-width: min(100%, 680px);" alt="A TPU-v5p-32 with its four hosts split into two train workers and two inference workers">
+        <figcaption><code>TPU-v5p-32</code> split as 2 train workers and 2 inference workers.</figcaption>
+      </figure>
+
+      <p>
+        With this method, there is relatively low orchestration overhead as a job is submitted with one TPU resource allocation and the <code>train.py</code> manages the splitting. Since the workers are still on one global mesh, RDMA weight sync can easily be performed over ICI. However, this method is hard to scale as allocating larger contiguous TPU nodes is dependent on availability.
+      </p>
+
+      <p>
+        The other approach involves embracing the distributed nature of async RL by allocating separate nodes for training and inference. For example, we can allocate a <code>TPU-v5p-16</code> for our trainer and then create a separate inference pool where we can allocate single nodes across different regions (e.g. 12 <code>tpu-v6e-8</code> across US regions and even European regions). Most notably this was used by Cursor for the training of <a href="https://arxiv.org/abs/2603.24477">Composer 2</a>.
+      </p>
+
+      <figure>
+        <img src="images/tpu_inference_pool.png?v=2" style="max-width: min(100%, 680px);" alt="A TPU-v5p-16 train worker communicating with a pool of independent TPU-v6e-8 inference nodes">
+        <figcaption>The train worker is allocated on a <code>TPU-v5p-16</code> and it communicates with a set inference pool of independent <code>TPU-v6e-8</code> nodes.</figcaption>
+      </figure>
+
+      <p>
+        This approach makes it easier to arbitrarily scale runs due to dynamic resource allocation (small number of fixed accelerators for the trainer, dynamic allocation for inference), but it adds a lot of overhead in terms of orchestration outside of the core training loop (e.g. checking for preempted workers, allocating and updating inference workers, etc.). Weight sync over RDMA is also not possible since the inference pool is not on the same mesh as the trainer. The best solution is using delta-weight sync, which sends the compressed weight deltas over the filesystem network <a class="cite" href="#ref-6">[6</a>, <a class="cite" href="#ref-7">7]</a>.
+      </p>
+
+      <p>
+        Since we were experimenting on smaller models (&le;32B), we chose option 1 to keep the implementation simple to enable faster experimentation.
+      </p>
+
+      <p>
+        The same script will be launched on every host following <a href="https://docs.jax.dev/en/latest/501/multiprocess.html">JAX's multi-host orchestration design</a>. Once JAX has initialized, the global devices can be partitioned into train and inference depending on the number of train hosts parsed from the async config and the corresponding meshes can be made<sup class="fn" id="fnref-3"><a href="#fn-3">3</a></sup>.
+      </p>
+
+      <pre><code class="language-python">@hydra.main(version_base=None, config_path="./configs/train")
+def main(cfg: DictConfig) -&gt; None:
+    stax.init_distributed_jax()
+
+    train_workers = cfg.async_config.train_workers
+    n_hosts = jax.process_count()
+    assert n_hosts &gt; train_workers &gt; 0, "Number of train workers must be between 1 and total number of processes - 1"
+    inference_workers = n_hosts - train_workers
+
+    devices = np.array(jax.devices())
+    devices_per_host = jax.local_device_count()
+
+    train_devices = devices[: train_workers * devices_per_host].reshape(train_workers, devices_per_host)
+    inference_devices = devices[train_workers * devices_per_host :].reshape(inference_workers, devices_per_host)
+
+    train_mesh = jax.sharding.Mesh(
+        train_devices,
+        ("processes", "local_devices"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+    inference_mesh = jax.sharding.Mesh(
+        inference_devices,
+        ("processes", "local_devices"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    global_mesh = jax.make_mesh(
+        (jax.process_count(), jax.local_device_count()),
+        ("processes", "local_devices"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    ...
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+      <p>
+        To represent the async state, we can create an <code>AsyncOptions</code> object which will be initialized on every host.
+      </p>
+
+      <pre><code class="language-python">@dataclass
+class AsyncOptions:
+    train_workers: int
+    inference_workers: int
+    queues: MPQueues
+    train_mesh: jax.sharding.Mesh
+    inference_mesh: jax.sharding.Mesh
+    global_mesh: jax.sharding.Mesh</code></pre>
+
+      <p>
+        We can then check the rank of each process and if it is less than <code>train_workers</code> it is assigned to be an <code>AsyncTrainWorker</code>, otherwise it is assigned as an <code>AsyncInferenceWorker</code>.
+      </p>
+
+      <pre><code class="language-python">@hydra.main(version_base=None, config_path="./configs/train")
+def main(cfg: DictConfig) -&gt; None:
+    ...
+    async_options = AsyncOptions(...)
+    rank = jax.process_index()
+    worker = (
+        AsyncTrainWorker if rank &lt; train_workers else AsyncInferenceWorker
+    )(cfg, async_options)
+    worker.start()
+
+    logger.info(f"Process at {VM_IP} finished.", log_for_all=True)</code></pre>
+
+      <p>
+        Now that the train and inference workers have been split, we need to find a way to communicate between them. The inference engine needs to receive prompts from the trainer and the trainer must be able to access rollouts from the engine while controlling the staleness. Ideally, it would be convenient if the inference worker could just push rollouts onto a queue and the trainer could pull off this queue, but a normal queue in Python doesn't span across multiple processes which are split across hosts. There exists a Python module <code>multiprocessing.managers</code> which allows us to share the object over a network using RPCs. When all the hosts are initialized, one host is assigned as the "global" host (you can think of it like the 0<sup>th</sup> rank, but it is not guaranteed to be the 0<sup>th</sup> JAX rank) which starts a manager server process which owns the queue and is the central host for accessing it.
+      </p>
+
+      <pre><code class="language-python">class MPQueues:
+    prompt_queue: queue.Queue
+    rollout_queue: queue.Queue
+    weight_sync_queue: queue.Queue[str]
+    inference_metrics_queue: queue.Queue[dict]
+    eval_prompt_queue: queue.Queue
+    eval_rollout_queue: queue.Queue
+    eval_done_queue: queue.Queue[str]
+
+    NAMES = (
+        "prompt_queue",
+        "rollout_queue",
+        "weight_sync_queue",
+        "inference_metrics_queue",
+        "eval_prompt_queue",
+        "eval_rollout_queue",
+        "eval_done_queue",
+    )
+
+    def __init__(self, global_ip: str = GLOBAL_IP, port: int = PORT, key: bytes = KEY):
+        self.global_ip = global_ip
+        self.port = port
+        self.key = key
+
+    def register(self, maxsizes: dict[str, int] | None = None) -&gt; None:
+        maxsizes = maxsizes or {}
+        for name in self.NAMES:
+            local_queue = queue.Queue(maxsize=maxsizes.get(name, 0))
+            QueueManager.register(f"get_{name}", callable=lambda q=local_queue: q)
+
+    def start_server(self) -&gt; None:
+        def _serve():
+            manager = QueueManager(address=("0.0.0.0", self.port), authkey=self.key)
+            server = manager.get_server()
+            logger.info(f"[Server] Queue server listening on {self.global_ip}:{self.port}...")
+            server.serve_forever()
+
+        threading.Thread(target=_serve, daemon=True).start()</code></pre>
+
+      <p>
+        In <code>train.py</code> the host whose <code>VM_IP</code> is equal to the <code>GLOBAL_IP</code> can start the central queue server.
+      </p>
+
+      <pre><code class="language-python">def main(...):
+    ...
+    queues = MPQueues(GLOBAL_IP)
+    queues.register(
+        maxsizes={
+            "prompt_queue": cfg.train_batch_size // cfg.loss_config.inference_config.group_size,
+            "weight_sync_queue": inference_workers,
+        }
+    )
+
+    if VM_IP == GLOBAL_IP:
+        queues.start_server()
+    sync_global_devices("serverReady")</code></pre>
+
+      <p>
+        All other hosts have access to their IP and the <code>GLOBAL_IP</code> which started the manager. These other processes will receive a proxy that enables the queue to act as a shared, single-process queue. These requests and data cross process boundaries through the proxy and are serialized via pickle. In this manner, each host creates its own connection to the prompt, rollout, weight sync and inference metrics queues and can place/receive data (push, pop, get) accordingly based on its role in the async system.
+      </p>
+
+      <pre><code class="language-python">class MPQueues:
+    ...
+
+    def connect(self, retries: int = 6):
+        manager = QueueManager(address=(self.global_ip, self.port), authkey=self.key)
+
+        for _ in range(retries):
+            try:
+                manager.connect()
+                for name in self.NAMES:
+                    setattr(self, name, getattr(manager, f"get_{name}")())
+                return
+            except ConnectionError:
+                logger.info(f"[Client] Waiting for server at {self.global_ip}...", log_for_all=True)
+                time.sleep(1)
+
+        raise ConnectionError(f"Could not connect to server at {self.global_ip} after {retries} attempts.")</code></pre>
+
+      <p>and</p>
+
+      <pre><code class="language-python">def main(...):
+    ...
+
+    queues.connect()
+
+    async_options = AsyncOptions(
+        train_workers=train_workers,
+        inference_workers=inference_workers,
+        queues=queues,
+        train_mesh=train_mesh,
+        inference_mesh=inference_mesh,
+        global_mesh=global_mesh,
+    )
+
+    logger.info(OmegaConf.to_yaml(cfg), log_for_all=True)
+
+    rank = jax.process_index()
+    worker = (
+        AsyncTrainWorker if rank &lt; train_workers else AsyncInferenceWorker
+    )(cfg, async_options)
+    worker.start()
+
+    logger.info(f"Process at {VM_IP} finished.", log_for_all=True)
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+      <p>
+        The last required communication between the train and inference workers is the weight sync, which will be described further below.
+      </p>
+
+      <h2 id="inference">Inference</h2>
+
+      <p>
+        Many state-of-the-art systems use separate inference engines such as <a href="https://vllm-project.github.io/2025/10/16/vllm-tpu.html">vLLM</a> or <a href="https://docs.sglang.io/docs/hardware-platforms/tpu">SGLang</a><sup class="fn" id="fnref-4"><a href="#fn-4">4</a></sup>. However, on TPUs both vLLM and SGLang are still under active development. Since we wanted to experiment across the entire RL loop and were not targeting long-context inference at the moment (&le;8192 sequence length), we instead use a simple generation loop. This gives us end-to-end control over the generations, stability and weight synchronization.
+      </p>
+
+      <p>
+        There are two required primitives for inference: prefill and decode.
+      </p>
+
+      <h3 id="prefill">Prefill</h3>
+
+      <p>
+        Prefill is relatively straightforward in which a compiled forward pass builds the KV cache and initial <code>InferenceState</code>. Since JAX arrays are immutable, the whole state is allocated upfront and dynamically sliced to its corresponding position (such as the KV cache and output tokens). Note, since the prefill function does not sample, there is no need to materialize the vocab distribution.
+      </p>
+
+      <pre><code class="language-python">class SingleInferenceReplica:
+    ...
+
+    def prefill(
+        self, input_tokens: Array, seq_lens: Array, params: PyTree, key: Array, prompt_id_offset: int
+    ) -&gt; tuple[InferenceState, Array]:
+        logger.info(f"Compiling prefill for sequence length {input_tokens.shape[1]}", log_for_all=True)
+
+        max_prefill_prompts = self.max_prefill_prompts
+        kv_cache_dtype = self.config.kv_cache_dtype
+        next_key, key = jax.random.split(key)
+
+        with jax.named_scope("prefill"):
+            kv_cache = self.model.init_kv_cache(
+                max_prefill_prompts,
+                length=self.max_attention_length,
+                dtype=kv_cache_dtype,
+                sharding=self.kv_cache_sharding,
+            )
+            _hidden, out_cache = self.model.apply(
+                params, x=input_tokens[:, :-1], sequence_lens=seq_lens - 1, kv_cache=kv_cache, apply_lm_head=False
+            )
+            out_tokens = (
+                jnp.ones((max_prefill_prompts, self.max_attention_length), dtype=jnp.int32, out_sharding=self.sharding)
+                * self.pad_token
+            )
+            out_logprobs = jnp.zeros(
+                (max_prefill_prompts, self.max_attention_length), dtype=jnp.float32, out_sharding=self.sharding
+            )
+            out_tokens = jax.lax.dynamic_update_slice_in_dim(out_tokens, input_tokens, 0, axis=1)
+            out_logprobs = jax.lax.dynamic_update_slice_in_dim(
+                out_logprobs,
+                -jnp.inf * jnp.ones(input_tokens.shape, dtype=jnp.float32, out_sharding=self.sharding),
+                0,
+                axis=1,
+            )
+
+        state = InferenceState(
+            next_token=input_tokens[:, -1:],
+            seq_lens=seq_lens,
+            kv_cache=out_cache,
+            key=key,
+            stop_mask=jnp.zeros((max_prefill_prompts, 1), dtype=bool, out_sharding=self.sharding),
+            end_of_think=jnp.zeros((max_prefill_prompts, 1), dtype=bool, out_sharding=self.sharding),
+            out_tokens=out_tokens,
+            out_logprobs=out_logprobs,
+            prompt_id=jnp.arange(input_tokens.shape[0], out_sharding=self.sharding)[:, None] + prompt_id_offset,
+        )
+        return state, next_key</code></pre>
+
+      <p>
+        Till this point, everything has been a compiled JAX function. Since XLA compiles fixed shapes, the tokenize function buckets each batch into the closest power of two which upper-bounds the number of distinct compiled graphs to $\log_2(\text{max\_seq\_len})$. The prefill step function leverages this and memoizes each unique compilation into a cache that can be invoked according to the appropriate precompiled length.
+      </p>
+
+      <h3 id="decode">Decode</h3>
+
+      <p>
+        The decode step is a core part of the generation loop. The first pass through is relatively simple as an <code>InferenceState</code> is taken in alongside the parameters and applied to the model with standard temperature based sampling (RLVR training runs usually don't use top-p or top-k, hence there is no requirement to use fused versions of them).
+      </p>
+
+      <pre><code class="language-python">def decode(state: InferenceState, params: PyTree) -&gt; InferenceState:
+    logger.info(f"Compiling decode step for attention length {state.kv_cache[0].k.shape[1]}", log_for_all=True)
+    key, sample_key = jax.random.split(state.key)
+
+    with jax.named_scope("fwd_pass"):
+        logits, out_cache = self.model.apply(
+            params,
+            x=state.next_token,
+            sequence_lens=state.seq_lens,
+            kv_cache=state.kv_cache,
+        )
+
+    with jax.named_scope("sampling"):
+        next_token, next_log_prob = naive_sample(
+            logits,
+            sample_key,
+            temperature=self.config.temperature,
+            top_k=None,
+            top_p=None,
+        )</code></pre>
+
+      <p>
+        There are 2 state handling features: the end of sequence masking logic (limits the max sequence length) and the reasoning budget (limits the CoT reasoning; used in many scaling RL papers <a class="cite" href="#ref-8">[8</a>, <a class="cite" href="#ref-9">9</a>, <a class="cite" href="#ref-10">10]</a>). Checking for the former uses either a length stop mask to determine if the max sequence length has been exceeded, or a separate EOS stop mask which checks if the newly generated token was an <code>eos_id</code> token.
+      </p>
+
+      <pre><code class="language-python">def _maybe_force_eos(
+    next_token: Array,  # [B, 1]
+    next_log_prob: Array,  # [B, 1]
+    stop_mask: Array,  # [B, 1]
+    seq_lens: Array,  # [B]
+    *,
+    max_seq_len: int,
+    eos_token_id: int,
+):
+    # using seq_len + 1 since the current seq len doesn't account for the newly generated token, meaning the next
+    # token generated will be at the max seq len and hence should be &lt;eos&gt;
+    length_stop_mask = stop_mask | (seq_lens[:, None] + 1 &gt;= max_seq_len)
+    eos_stop_mask = next_token == eos_token_id
+    stop_mask = eos_stop_mask | length_stop_mask
+
+    # always set next token for the stop mask to be eos
+    # if length_stop_mask is true then we want to force prob 1 (log = 0) to be eos
+    # otherwise use the real gen prob
+    next_token = jnp.where(stop_mask, eos_token_id, next_token)
+    next_log_prob = jnp.where(length_stop_mask, 0, next_log_prob)
+
+    return next_token, next_log_prob, stop_mask</code></pre>
+
+      <p>
+        Reasoning budgets are implemented by inserting a phrase to ensure the thinking tokens end and an answer is forced naturally using a phrase such as "Okay, time is up. Let me stop thinking and formulate a final answer now. \n\n&lt;end_of_think&gt;". The actual implementation of <code>_maybe_force_eot</code> is a bit tricky since the phrase spans multiple tokens and the process of decoding unrolls a single token at a time to ensure it's compilable. The implementation backtracks the number of tokens in the phrase, checking each position and inserting the phrase token if the <code>current_len + remaining_tokens_in_stop_phrase == reasoning_length</code>. If the final token is inserted, then the end of thinking mask is set to true.
+      </p>
+
+      <pre><code class="language-python">def _maybe_force_eot(
+    next_token: Array,  # [B, 1]
+    next_log_prob: Array,  # [B, 1]
+    end_of_think_mask: Array,  # [B, 1]
+    seq_lens: Array,  # [B]
+    *,
+    reasoning_budget: int,
+    token_sequence: list[int],
+):
+    think_token = token_sequence[-1]
+    total_tokens = len(token_sequence)
+
+    end_of_think_mask = end_of_think_mask | (next_token == think_token)
+
+    for t in range(total_tokens):
+        # NOTE: only 1 token in the loop can be inserted at most since the equality is different
+        # for each token
+        insert_token = (seq_lens[:, None] + (total_tokens - t)) == reasoning_budget
+        interrupt_mask = insert_token &amp; ~end_of_think_mask
+        next_token = jnp.where(interrupt_mask, token_sequence[t], next_token)
+        next_log_prob = jnp.where(interrupt_mask, 0.0, next_log_prob)
+
+    end_of_think_mask = end_of_think_mask | interrupt_mask
+
+    return next_token, next_log_prob, end_of_think_mask</code></pre>
+
+      <p>
+        Integrating into the decode loop, if a reasoning budget is set, the interrupt thinking function is used while the EOS function is always called. Finally, the selected tokens are replaced.
+      </p>
+
+      <pre><code class="language-python">def decode(...):
+    ...
+    with jax.named_scope("masking"):
+        end_of_think = state.end_of_think
+        if self.config.reasoning_budget is not None:
+            next_token, next_log_prob, end_of_think = _maybe_force_eot(
+                next_token,
+                next_log_prob,
+                state.end_of_think,
+                state.seq_lens,
+                reasoning_budget=self.config.reasoning_budget,
+                token_sequence=self.thinking_tokens,
+            )
+
+        next_token, next_log_prob, stop_mask = _maybe_force_eos(
+            next_token,
+            next_log_prob,
+            state.stop_mask,
+            state.seq_lens,
+            max_seq_len=self.config.max_seq_len,
+            eos_token_id=self.eos_token,
+        )
+
+    rows = jnp.arange(state.out_tokens.shape[0])
+    write_index = out_cache[0].length
+    out_tokens = state.out_tokens.at[rows, write_index].set(next_token[:, 0])
+    out_logprobs = state.out_logprobs.at[rows, write_index].set(next_log_prob[:, 0])
+
+    return InferenceState(
+        next_token=next_token,
+        kv_cache=out_cache,
+        key=key,
+        seq_lens=state.seq_lens + 1,
+        stop_mask=stop_mask,
+        end_of_think=end_of_think,
+        out_tokens=out_tokens,
+        out_logprobs=out_logprobs,
+        prompt_id=state.prompt_id,
+    )</code></pre>
+
+      <h3 id="continuous-batching">Continuous Batching</h3>
+
+      <p>
+        To create the continuous batching loop, the decode function should be run until at least 1 rollout is finished so that a substitution can occur with the index of the next prompt (each prompt is rolled out $G$ times).
+      </p>
+
+      <pre><code class="language-python">def _decode_single_loop(
+    self, state: InferenceState, params: PyTree, prefill_prompts: InferenceState, next_index: int
+) -&gt; tuple[InferenceState, Array, Array, Array, Array]:
+    with jax.named_scope("single_decode_loop"):
+        before_length = state.kv_cache[0].length
+        state = jax.lax.while_loop(
+            lambda state: ~jnp.any(state.stop_mask),
+            lambda state: self.decode(state, params),
+            state,
+        )
+        after_length = state.kv_cache[0].length
+
+        index = jnp.argmax(state.stop_mask[:, 0], keepdims=True)
+        tokens, logprobs, prompt_ids = (
+            state.out_tokens[index],
+            state.out_logprobs[index],
+            state.prompt_id[index],
+        )
+
+    with jax.named_scope("sub_next_batch"):
+        next_batch = self.create_batch(prefill_prompts, next_index)
+        state = self.sub_batch(state, next_batch)
+
+    return state, tokens, logprobs, prompt_ids, jnp.max(after_length - before_length)</code></pre>
+
+      <p>
+        For the substitution, the prefill prompt corresponding to the index is sliced, the padding is removed by shifting it back and then it is replaced.
+      </p>
+
+      <pre><code class="language-python">def create_batch(self, prefill_prompts: InferenceState, index: int | Array) -&gt; InferenceState:
+    def ds(x):
+        return jax.lax.dynamic_slice_in_dim(x, index, 1, axis=0)
+
+    return InferenceState(
+        next_token=ds(prefill_prompts.next_token),
+        kv_cache=[
+            KVCache(k=ds(cache.k), v=ds(cache.v), length=ds(cache.length)) for cache in prefill_prompts.kv_cache
+        ],
+        key=prefill_prompts.key,
+        seq_lens=ds(prefill_prompts.seq_lens),
+        stop_mask=ds(prefill_prompts.stop_mask),
+        end_of_think=ds(prefill_prompts.end_of_think),
+        out_tokens=ds(prefill_prompts.out_tokens),
+        out_logprobs=ds(prefill_prompts.out_logprobs),
+        prompt_id=ds(prefill_prompts.prompt_id),
+    )
+
+def sub_batch(self, state: InferenceState, new_batch: InferenceState) -&gt; InferenceState:
+    index = jnp.argmax(state.stop_mask[:, 0], keepdims=True)
+    new_batch = new_batch.roll(new_batch.seq_lens - 1)
+    return state.sub(new_batch, index)</code></pre>
+
+      <p>
+        In the generation loop, the single decode function is first compiled (and the inference state arg is donated, as to alias the cache), then bookkeeping is done for the local prefill prompt batch to the global prompt ids. The local-to-global encoding is needed since a past state can be passed to the function. For example, if the queue of prompt decodes is <code>[0, 0, 0, 1, 1, 1]</code> and the in-flight decode size is 3, the last batch of 3 remaining prompts won't finish. So either static batching is done where <code>jnp.where(~jnp.all(stop_mask))</code> is used for the <code>jnp.where</code> condition or the in-flight generation is paused, a new batch is prefilled and then the generation is resumed. The latter was chosen to avoid the same problem PipelineRL was trying to fix.
+      </p>
+
+      <pre><code class="language-python">def continuous_batch(
+    self, prefill_prompts: InferenceState, state: InferenceState | None
+) -&gt; tuple[InferenceState, dict[str, float]]:
+    if self.decode_fn is None:
+        self.decode_fn = jax.jit(self._decode_single_loop, donate_argnums=(0,))
+
+    global_ids = jax.device_get(prefill_prompts.prompt_id).flatten().tolist()
+    local_to_global = {i: gid for i, gid in enumerate(global_ids)}
+
+    prompt_queue: list[int] = [
+        i
+        for i in range(self.max_prefill_prompts)
+        for _ in range(self.global_rollouts[local_to_global[i]].n_rollouts)
+    ]
+
+    finished = {"tokens": [], "logprobs": [], "prompt_ids": []}
+    steps = []</code></pre>
+
+      <p>
+        If no prior state is provided, an initial state is created by popping off prompts to fill the in-flight batch. The global rollouts map an <code>id</code> to an <code>InferenceRollout</code> object which tracks the data sample (has a prompt + answer for the verifier), decoded strings, tokens, logprobs, as well as the oldest weight iteration (useful for staleness management). Since it stores the raw decode tokens and logprobs, the trainer operates on a token-in, token-out (TITO) principle <a class="cite" href="#ref-11">[11]</a>.
+      </p>
+
+      <pre><code class="language-python">@dataclass
+class InferenceRollout:
+    sample: Sample
+    rollout_strs: list[str]
+    rollout_tokens: list[np.ndarray]
+    rollout_logprobs: list[np.ndarray]
+    weight_iteration: list[int]
+    n_rollouts: int = 1
+    is_eval: bool = False
+
+    def __len__(self):
+        assert len(self.rollout_logprobs) == len(self.rollout_tokens), (
+            "rollout_logprobs and rollout_tokens must have the same length"
+        )
+        return len(self.rollout_tokens)
+
+    @property
+    def lag(self) -&gt; int:
+        return min(self.weight_iteration) if self.weight_iteration else 0
+
+class InferenceWorker:
+    ...
+
+    def continuous_batch(
+        self, prefill_prompts: InferenceState, state: InferenceState | None
+    ) -&gt; tuple[InferenceState, dict[str, float]]:
+        ...
+
+        with Tracker(timer=True) as t:
+            if state is None:
+                ids = [prompt_queue.pop() for _ in range(self.config.max_decode_batch_size)]
+                state = self.create_initial_state(prefill_prompts, ids)
+                for i in ids:
+                    self.global_rollouts[local_to_global[i]].weight_iteration.append(self.weight_iteration)
+
+            while len(prompt_queue) &gt; 0:
+                next_index = prompt_queue.pop()
+
+                (state, tokens, logprobs, prompt_ids, n_steps) = self.decode_fn(
+                    state, self.params, prefill_prompts, next_index
+                )
+
+                finished["tokens"].append(tokens)
+                finished["logprobs"].append(logprobs)
+                finished["prompt_ids"].append(prompt_ids)
+
+                steps.append(n_steps)
+                self._maybe_update_params()
+                self.global_rollouts[local_to_global[next_index]].weight_iteration.append(self.weight_iteration)
+
+            gathered = {k: np.concatenate([jax.device_get(x) for x in v], axis=0) for k, v in finished.items()}</code></pre>
+
+      <p>
+        Metrics can then be computed and returned alongside the in-flight batch.
+      </p>
+
+      <pre><code class="language-python">def continuous_batch(
+    self, prefill_prompts: InferenceState, state: InferenceState | None
+) -&gt; tuple[InferenceState, dict[str, float]]:
+    ...
+
+    for i in range(gathered["tokens"].shape[0]):
+        pid = gathered["prompt_ids"][i].item()
+        self.global_rollouts[pid].rollout_tokens.append(gathered["tokens"][i])
+        self.global_rollouts[pid].rollout_logprobs.append(gathered["logprobs"][i])
+
+    queued_steps: int = sum(int(jax.device_get(s)) for s in steps)
+    subbed_steps = len(steps)
+
+    tokens_per_second = queued_steps * self.config.max_decode_batch_size / t.data["time"]
+    sequences_per_second = queued_steps / t.data["time"]
+    decode_metrics = {
+        "decode_steps": queued_steps,
+        "decode_steps_subbed": subbed_steps,
+        "decode_time": t.data["time"],
+        "decode_tps": tokens_per_second,
+        "decode_sps": sequences_per_second,
+    }
+    return state, decode_metrics</code></pre>
+
+      <h3 id="end-to-end-generation">End To End Generation</h3>
+
+      <p>
+        When integrating all this together, the <code>start(self, key: Array)</code> method controls the end-to-end generation loop.
+      </p>
+
+      <pre><code class="language-python">def start(self, key: Array):
+    key = jax.device_put(key, self.sharding)
+    prev_state = None
+
+    while True:
+        with Tracker(timer=True) as t:
+            input_tokens, seq_lens, prompt_metrics = self.get_samples()
+            key, gen_key = jax.random.split(key)
+    ...</code></pre>
+
+      <p>
+        First, samples are collected by pulling off the eval prompt queue (as it has higher priority), followed by the train prompt queue. Each sample is then assigned an index in the global rollouts dictionary, with its corresponding <code>InferenceRollout(...)</code> initialized and the prompts are tokenized.
+      </p>
+
+      <pre><code class="language-python">def get_samples(self):
+    with Tracker(timer=True) as t1:
+        samples: list[tuple[Sample, bool]] = []
+        while len(samples) &lt; self.max_prefill_prompts:
+            try:
+                samples.append((self.async_options.queues.eval_prompt_queue.get_nowait(), True))
+            except Empty:
+                break
+
+        n_eval = len(samples)
+        while len(samples) &lt; self.max_prefill_prompts:
+            samples.append((self.async_options.queues.prompt_queue.get(timeout=TIMEOUT), False))
+
+    with Tracker(timer=True) as t2:
+        for i, (sample, is_eval) in enumerate(samples):
+            self.global_rollouts[self.prompt_id_offset + i] = InferenceRollout(
+                sample=sample,
+                rollout_tokens=[],
+                rollout_logprobs=[],
+                rollout_strs=[],
+                weight_iteration=[],
+                n_rollouts=(self.eval_group_size or self.config.group_size) if is_eval else self.config.group_size,
+                is_eval=is_eval,
+            )
+
+        prompts = [sample.prompt for sample, _ in samples]
+        input_tokens, seq_lens = self.tokenize(prompts)
+
+    metrics = {"get_prompts_time": t1.data["time"], "tokenize_time": t2.data["time"], "eval_prompts": n_eval}
+    return input_tokens, seq_lens, metrics</code></pre>
+
+      <p>
+        The prepared batch is sent to the <code>batch_rollout</code> function next.
+      </p>
+
+      <pre><code class="language-python">def start(self, key: Array):
+    ...
+
+    while True:
+        with Tracker(timer=True) as t:
+            ...
+            prev_state, batch_metrics = self.batch_rollout(input_tokens, seq_lens, gen_key, prev_state)
+            gather_metrics = self.gather_rollouts()</code></pre>
+
+      <p>
+        Since the <code>batch_tokens</code> and <code>seq_lens</code> are NumPy arrays located on the CPU, they need to be passed to the TPU which can be done with the <code>jax.device_put(...)</code> function with the sharding set to be replicated per device, <code>self.sharding = jax.NamedSharding(self.mesh, P())</code>. Once the data has been placed, the prefill step function is called which passes the returned prefill state into the continuous batch function. The new inference state is updated and the inference metrics are returned.
+      </p>
+
+      <pre><code class="language-python">def batch_rollout(
+    self, batch_tokens: np.ndarray, seq_lens: np.ndarray, key: Array, prev_state: InferenceState | None
+) -&gt; tuple[InferenceState, dict[str, float]]:
+    x_batch_sharded = jax.device_put(batch_tokens, self.sharding)
+    seq_lens_sharded = jax.device_put(seq_lens, self.sharding)
+
+    prefill_state, prefill_metrics = self.prefill_step(x_batch_sharded, seq_lens_sharded, self.params, key)
+    prev_state, decode_metrics = self.continuous_batch(prefill_state, prev_state)
+
+    return prev_state, prefill_metrics | decode_metrics</code></pre>
+
+      <p>
+        Those rollouts can then be processed, cleaned and de-tokenized whilst all the metrics are aggregated and shared to the multi-processed inference metrics queue.
+      </p>
+
+      <pre><code class="language-python">def start(self, key: Array):
+    ...
+
+    while True:
+        ...
+        gather_metrics = self.gather_rollouts()
+
+        self.prompt_id_offset += self.max_prefill_prompts
+
+        metrics = (
+            batch_metrics
+            | gather_metrics
+            | prompt_metrics
+            | {"total_time": t.data["time"], "worker_id": self.global_worker_id}
+        )
+        self.async_options.queues.inference_metrics_queue.put(metrics)</code></pre>
+
+      <h3 id="scaling-replicas">Scaling Replicas</h3>
+
+      <p>
+        Now that the structure of a single inference worker is complete, the question arises of how devices can be split across the different workers. Since there is no communication between replicas, each replica can be assigned to a thread managing some set of the devices. In practice, this is represented as a single-replica/TP group, but it is currently kept to <code>tp=1</code> so the set of devices is equal to 1. All of the methods written above can be encapsulated in the <code>SingleInferenceReplica</code> where the per-replica devices are used to initialize the single inference replica sharding.
+      </p>
+
+      <pre><code class="language-python">class SingleInferenceReplica:
+    def __init__(
+        self,
+        config: InferenceConfig,
+        model: Model,
+        async_state: AsyncState,
+        async_options: AsyncOptions,
+        worker_id: int,
+        inference_rank: int,
+        devices: np.ndarray,
+        *,
+        eval_group_size: int | None = None,
+    ):
+        self.devices = devices
+        self.tp = devices.size
+
+        self.mesh = jax.sharding.Mesh(devices, axis_names=(TP_AXIS,), axis_types=(jax.sharding.AxisType.Explicit,))
+        self.sharding = jax.NamedSharding(self.mesh, P())</code></pre>
+
+      <p>
+        The <code>AsyncInferenceWorker</code> initialized on each host arranges its local devices into a grid based on the TP dim and instantiates them into a <code>SingleInferenceReplica</code> worker array.
+      </p>
+
+      <pre><code class="language-python">class AsyncInferenceWorker(Worker):
+    def __init__(self, trainer_config: TrainerConfig, async_options: AsyncOptions):
+        ...
+        device_groups = np.array(jax.local_devices()).reshape(-1, self.inference_config.tp)
+
+        workers = [
+            SingleInferenceReplica(
+                self.inference_config,
+                self.model,
+                self.async_state,
+                async_options,
+                i,
+                self.worker_rank,
+                device_groups[i],
+                eval_group_size=self.eval_config.group_size,
+            )
+            for i in range(device_groups.shape[0])
+        ]
+
+        self.thread_workers = [threading.Thread(target=w.start, args=(init_keys[i],)) for i, w in enumerate(workers)]
+
+    ...
+
+    def start(self):
+        for t in self.thread_workers:
+            t.start()
+        for t in self.thread_workers:
+            t.join()</code></pre>
+
+      <h3 id="optional-scaling-replicas-with-spmd">Optional: Scaling Replicas with SPMD</h3>
+
+      <p>
+        The approach presented above makes individual replicas independent but a more JAX/SPMD version would have been to make a 2D mesh of <code>(dp, tp)</code> with the batch sharded across the <code>dp</code> axis. This approach was tested; however, in practice it led to several problems, one of which we describe below. With this sharding setup, the substitution logic from above still works since XLA inserts the correct collectives. However, naively doing this has a major flaw. When implemented, the memory would spike and the majority of the step time was in the <code>sub_batch</code> function. Looking at the trace, we can see the peak memory spikes in the decode step and the majority of the trace is spent on all-gathers.
+      </p>
+
+      <figure>
+        <img src="images/spmd_trace.png?v=2" style="max-width: min(100%, 680px);" alt="Profiler trace of the SPMD decode step showing a memory spike and time dominated by all-gathers">
+        <figcaption>Wrapping the function call in <code>jax.jit</code> led to a significant memory spike of up to ~15.7 GB.</figcaption>
+      </figure>
+
+      <figure class="side-by-side">
+        <div>
+          <img src="images/spmd_trace_2.png?v=2" alt="">
+          <img src="images/spmd_trace_3.png?v=2" alt="">
+        </div>
+        <figcaption>Most of the single decode loop is spent in the sub batch and the majority of the XLA op is all-gather.</figcaption>
+      </figure>
+
+      <p>
+        The reason this occurred is because the KV cache was being all-gathered, the substitution occurred on every device and the results were scattered back. This is visualized below in the case of a batch of 16 in-flight sequences sharded across 4 devices.
+      </p>
+
+      <figure class="grid-2x2">
+        <div>
+          <img src="images/spmd_step_1.png?v=2" alt="Step 1: the new batch needs to go into slot 5, which is slot 1 on TPU 1">
+          <img src="images/spmd_step_2.png?v=2" alt="Step 2: the inference state is all-gathered so every device holds a full replica">
+          <img src="images/spmd_step_3.png?v=2" alt="Step 3: the slot is replaced on every device's copy of the inference state">
+          <img src="images/spmd_step_4.png?v=2" alt="Step 4: the inference state is scattered back along the batch axis">
+        </div>
+        <figcaption>
+          A step by step example of the XLA inserted collectives. <i>Top-left:</i> the new batch has to go into slot 5 which is slot 1 on TPU 1. <i>Top-right:</i> first the inference state is replicated across all devices. <i>Bottom-left:</i> the slot is replaced on all inference states. <i>Bottom-right:</i> the inference state is scattered back along the batch.
+          <br>
+          We can fix this by directly skipping from step 1 (top-left) to step 4 (bottom-right).
+        </figcaption>
+      </figure>
+
+      <p>
+        Using JAX's manual sharding mode, we can replace this using a simple <code>shard_map</code> function that only replaces the index on the device where it lives.
+      </p>
+
+      <pre><code class="language-python">@partial(
+    jax.shard_map,
+    mesh=self.shardings.mesh,
+    in_specs=(
+        jax.tree.map(lambda x: x.spec, self.shardings.state_sharding),
+        jax.tree.map(lambda x: P(), self.shardings.state_sharding),
+        P(),
+    ),
+    out_specs=(jax.tree.map(lambda x: x.spec, self.shardings.state_sharding)),
+)
+def _sub(old_state: InferenceState, new_state: InferenceState, index: Array) -&gt; InferenceState:
+    B_local = old_state.next_token.shape[0]
+    device_id = jax.lax.axis_index(AXIS_NAME)
+
+    start_idx = B_local * device_id
+    end_idx = B_local * (device_id + 1)
+
+    local_idx = index - start_idx
+
+    sub_on_this_device = (index &gt;= start_idx) &amp; (index &lt; end_idx)
+
+    old_state = jax.lax.cond(
+        sub_on_this_device[0], lambda o, n, i: o.sub(n, i), lambda o, _n, _i: o, old_state, new_state, local_idx
+    )
+
+    return old_state</code></pre>
+
+      <p>
+        The step time drops from roughly ~75ms to 27ms when debugging - an interesting case showcasing the compiler is not always right!
+      </p>
+
+      <figure>
+        <img src="images/spmd_trace_fixed.png?v=2" style="max-width: min(100%, 680px);" alt="Profiler trace after switching to manual sharding, showing a much shorter step">
+        <figcaption>Profile after the manual sharding.</figcaption>
+      </figure>
+
+      <h2 id="trainer">Trainer</h2>
+
+      <h3 id="train-loop">Train Loop</h3>
+
+      <p>
+        The core training loop is relatively simple: rollouts are fetched and converted into RL batches, a training step is performed and the weights are then synchronized. Below, we describe each of these steps in more detail.
+      </p>
+
+      <pre><code class="language-python">class AsyncTrainWorker(Worker):
+    ...
+
+    def train(self):
+        ...
+        self.log_info(f"Starting training loop at step {self.global_step}")
+        while self.global_step &lt; self.total_steps:
+
+            with stax.Tracker(timer=True) as t:
+                generations, local_rollout_metrics = self.get_rollouts()
+
+                local_train_batch, local_train_batch_metrics = self.train_dataset.prepare_batch(generations, train=True)
+
+                self.params, self.opt_state, train_metrics = self.train_step(
+                    self.params, self.opt_state, local_train_batch, teacher_params=self.teacher_params
+                )
+                weight_sync_time = self.train_sync_weights()
+
+            metrics = (
+                train_metrics
+                | metrics_all_reduce(local_train_batch_metrics, self.async_options.train_mesh)
+                | metrics_all_reduce(local_rollout_metrics, self.async_options.train_mesh)
+            )
+
+            ...
+            # checkpointing / logging code here
+            ...
+
+        self.log_info("Training complete.")
+
+    def start(self):
+        try:
+            self.train()
+        finally:
+            self.finish()</code></pre>
+
+      <h3 id="samples">Samples</h3>
+
+      <p>
+        <code>get_rollouts</code> is a blocking function that waits for enough rollouts on each device. If the train batch size is $B = PG$, then each host needs to collect $P / \text{num hosts}$ rollouts (each rollout object has $G$ rollouts attached). Filtering and weight control is also implemented here. If the earliest weight iteration for any of the group rollouts is more than the specified lag, it is thrown out. Similarly, it is common to do zero-variance filtering, introduced in DAPO, to ensure advantages are non-zero <a class="cite" href="#ref-12">[12]</a>.
+      </p>
+
+      <pre><code class="language-python">class AsyncTrainWorker(Worker):
+    ...
+
+    def get_rollouts(self) -&gt; tuple[list[InferenceRollout], dict]:
+        rollouts = []
+        weight_iterations = []
+        num_filtered_rollouts = 0
+
+        with stax.Tracker(timer=True) as t:
+            while len(rollouts) &lt; self.train_n_prompts_per_host:
+                rollout: InferenceRollout = self.async_options.queues.rollout_queue.get(timeout=TIMEOUT)
+
+                if num_filtered_rollouts &gt; 0 and num_filtered_rollouts % 10 == 0:
+                    logger.warning(
+                        f"Filtered {num_filtered_rollouts} rollouts due to lag or zero variance, consider increasing max_lag or disabling zero variance filtering if this is happening frequently.",
+                        log_for_all=True,
+                    )
+
+                if (lag_diff := (self.weight_iteration - rollout.lag)) &gt; self.config.async_config.max_lag:
+                    num_filtered_rollouts += 1
+                    continue
+
+                if self.config.loss_config.filter_zero_variance and self.train_dataset.check_rollout_zero_variance(
+                    rollout
+                ):
+                    num_filtered_rollouts += 1
+                    continue
+
+                rollouts.append(rollout)
+                weight_iterations.append(lag_diff)
+
+        metrics = {
+            "train/rollout_queue_wait_time": t.data["time"],
+            "train/max_off_policy": max(weight_iterations),
+            "train/min_off_policy": min(weight_iterations),
+            "train/mean_off_policy": sum(weight_iterations) / len(weight_iterations),
+            "train/num_filtered_rollouts": num_filtered_rollouts,
+        }
+
+        return rollouts, metrics</code></pre>
+
+      <p>
+        Our train dataset can then run a verifier over the rollouts and return back a simple <code>RLBatch</code> object.
+      </p>
+
+      <pre><code class="language-python">@struct.dataclass
+class RLBatch:
+    tokens: jax.Array  # [B, max_seq_len] where B = P * G, P = num prompts, G = group size
+    # logprobs from sampler
+    reference_model_logprobs: jax.Array  # [B, max_seq_len] logprobs of sampled token
+    seq_lens: jax.Array  # [B] length of sequences (excluding padding)
+    rewards: jax.Array  # [B] reward of each sequence
+    group_mean: jax.Array  # [B] mean reward for sequence's group
+    group_std: jax.Array  # [B] std of reward for sequence's group
+    token_mask: jax.Array  # [B, T] mask for applying rl</code></pre>
+
+      <h3 id="shardings">Shardings</h3>
+
+      <p>
+        Before moving to the train step, we describe our sharding framework. The sharding config can be specified as seen below with 3 axis sharding: DP, FSDP and CP Ulysses.
+      </p>
+
+      <pre><code class="language-python">@dataclass
+class MeshConfig:
+    dp: int = 1
+    fsdp: int = -1
+    cp_ulysses: int = 1
+
+@dataclass
+class ShardingConfig:
+    params_shape: PyTree[jax.ShapeDtypeStruct]
+    opt_state_shape: PyTree[jax.ShapeDtypeStruct]
+
+    mesh_config: MeshConfig
+
+    opt_state_offload: bool = False
+    # dp options
+    data_shard_dim: int = 0
+    # fsdp options
+    min_bytes_for_fsdp: int = int(1e7)  # 1e7/(1024*1024) \approx 10MB
+    weight_shard_dim: int = 0
+    # cp options
+    cp_shard_dim: int = 0</code></pre>
+
+      <p>
+        Then the <code>Shardings</code> class encompasses the shardings for the different components required in the trainer.
+      </p>
+
+      <pre><code class="language-python">@dataclass
+class Shardings:
+    param_sharding: PyTree[NamedSharding]
+    opt_state_sharding: PyTree[NamedSharding]
+    metrics_sharding: NamedSharding
+    shard_data: Callable[[PyTree], PyTree]
+    mesh: jax.sharding.Mesh</code></pre>
+
+      <p>
+        Before the shardings are applied on any of the data, the SPMD train mesh needs to be set up by taking in a mesh config alongside the devices to shard over and returns the corresponding mesh.
+      </p>
+
+      <pre><code class="language-python">def setup_mesh(mesh_config: MeshConfig, devices: np.ndarray | None = None):
+    if not jax.distributed.is_initialized():
+        raise ValueError("jax distributed has not been initialized")
+
+    if devices is None:
+        devices = np.array(jax.devices())
+    n_devices = np.prod(devices.shape)
+
+    axis_sizes = (mesh_config.dp, mesh_config.fsdp, mesh_config.cp_ulysses)
+
+    axis_type = (jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto)
+    axis_sizes = resolve_axis_sizes(axis_sizes, n_devices)
+    axis_names = AXIS_NAMES_ENUM.full_mesh()
+
+    try:
+        mesh = jax.make_mesh(axis_sizes, axis_names, axis_type, devices=list(devices))
+    except Exception as _:
+        # if jax cannot create optimal mesh layout, make a manual mesh
+        logger.warning("Failed to create mesh with make_mesh, falling back to `jax.sharding.Mesh`")
+        mesh = Mesh(devices, axis_names, axis_type)
+
+    jax.set_mesh(mesh)
+    logger.info(f"setup mesh : {mesh}")
+    logger.info("Set `xla_tpu_enable_latency_hiding_scheduler=false` for better comms-compute overlap")
+    return mesh</code></pre>
+
+      <p>
+        Then, the main function <code>get_sharding(...)</code> takes in a mesh alongside a sharding config and returns the <code>Shardings</code> object. The <code>shard_param</code> function takes in a param and determines if it should be sharded over the FSDP dim. If it is a 1D param (e.g. bias) or its byte size is less than the <code>config.min_bytes_for_fsdp</code> (to avoid hop latencies on TPUs<sup class="fn" id="fnref-5"><a href="#fn-5">5</a></sup>), it will be replicated. Otherwise the <code>weight_shard_dim</code> is sharded across the FSDP axis. This function can then be applied to the param sharding and the optimizer state shardings, whilst the metrics sharding will always be replicated.
+      </p>
+
+      <pre><code class="language-python">def get_sharding(mesh: Mesh, config: ShardingConfig) -&gt; Shardings:
+    """Adapted from https://github.com/kvfrans/jaxtransformer"""
+    assert len(mesh.axis_names) == 3, "mesh should have three axes: dp, fsdp, cp"
+
+    replicate_sharding = NamedSharding(mesh, P())
+
+    def shard_param(param):
+        if param.ndim &lt; 2 or jnp.dtype(param.dtype).itemsize * param.size &lt; config.min_bytes_for_fsdp:
+            shard = replicate_sharding
+        else:
+            param_tuple = [None for _ in range(config.weight_shard_dim)] + [AXIS_NAMES_ENUM.FSDP.value]
+            shard = NamedSharding(mesh, P(*(param_tuple)))
+        return shard
+
+    param_sharding = jax.tree.map(shard_param, config.params_shape)
+    opt_state_sharding = jax.tree.map(shard_param, config.opt_state_shape)
+    metrics_sharding = replicate_sharding
+
+    def shard_data(batch: PyTree) -&gt; PyTree:
+        ...
+
+    if config.opt_state_offload:
+        opt_state_sharding = jax.tree.map(lambda x: x.with_memory_kind("pinned_host"), opt_state_sharding)
+
+    return Shardings(param_sharding, opt_state_sharding, metrics_sharding, shard_data, mesh)</code></pre>
+
+      <p>
+        The shard data function is returned as the method that can map over our batch structure. It uses a <code>tree.map(...)</code> on the <code>put_batch_fn</code> for each individual array in the PyTree. A single dimensional array is sharded on the 0<sup>th</sup> axis across the DP sub mesh (DP + FSDP), otherwise the axis placements are resolved according to the config. Next, the global sharding needs to be created for the NumPy array <code>x</code> that is coming in across hosts. Since this will be sharded along the batch axis, the mesh devices are flattened into one 1D submesh which is passed into the <code>jax.make_array_from_process_local_data(...)</code> and returns the global array. The global array is then resharded with the desired target sharding.
+      </p>
+
+      <pre><code class="language-python">def shard_data(batch: PyTree) -&gt; PyTree:
+    def put_batch_fn(x: Array):
+        if is_key(x):
+            return jax.device_put(x, replicate_sharding)
+
+        data_tuple = [None for _ in range(x.ndim)]
+        if x.ndim == 1:
+            data_tuple[0] = (AXIS_NAMES_ENUM.DP.value, AXIS_NAMES_ENUM.FSDP.value)
+        else:
+            if config.cp_shard_dim == config.data_shard_dim:
+                data_tuple[config.data_shard_dim] = (
+                    AXIS_NAMES_ENUM.DP.value,
+                    AXIS_NAMES_ENUM.FSDP.value,
+                    AXIS_NAMES_ENUM.CP_ULYSSES.value,
+                )
+            else:
+                data_tuple[config.data_shard_dim] = (AXIS_NAMES_ENUM.DP.value, AXIS_NAMES_ENUM.FSDP.value)
+                data_tuple[config.cp_shard_dim] = AXIS_NAMES_ENUM.CP_ULYSSES.value
+
+        target_data_sharding = NamedSharding(mesh, P(*data_tuple))
+        global_sharding = [None] * config.data_shard_dim + [
+            (AXIS_NAMES_ENUM.DP.value, AXIS_NAMES_ENUM.FSDP.value, AXIS_NAMES_ENUM.CP_ULYSSES.value)
+        ]
+        global_data_sharding = NamedSharding(mesh, P(*global_sharding))
+
+        num_hosts = mesh.devices.size // jax.local_device_count()
+        global_x_shape = (
+            *x.shape[: config.data_shard_dim],
+            x.shape[config.data_shard_dim] * num_hosts,
+            *x.shape[config.data_shard_dim + 1 :],
+        )
+
+        global_x = jax.make_array_from_process_local_data(global_data_sharding, x, global_x_shape)
+        target_x = jax.device_put(global_x, target_data_sharding)
+        return target_x
+
+    return jax.tree.map(put_batch_fn, batch)</code></pre>
+
+      <p>
+        To perform the shardings over the train function, the general wrapper <code>get_steps_fn</code> sets up the mesh and shardings through the methods above. Those shardings create a <code>train_shardings</code> dict which are applied as the out shardings for the train function. The train and val functions are standard gradient accumulation forward passes and the backwards loop is omitted for brevity.
+      </p>
+
+      <pre><code class="language-python">def get_steps_fn(
+    step_fn: StepFn,
+    model: modelBase,
+    tx: optax.GradientTransformation,
+    sharding: ShardingConfig,
+    has_aux: bool = True,
+    grad_steps: int = 1,
+    reduce_fn: Callable[[int | Array, Batch], int | Array] = lambda s, b: s + 1,
+    val_steps: int = 1,
+    devices: Optional[np.ndarray] = None,
+    **jit_kwargs,
+) -&gt; Tuple[TrainFn, ValFn, Shardings]:
+    single_step = partial(step_fn, model)
+
+    mesh = setup_mesh(sharding.mesh_config, devices=devices)
+
+    shardings = get_sharding(mesh, sharding)
+    train_shardings = {
+        "metrics": shardings.metrics_sharding,
+        "params": shardings.param_sharding,
+        "opt_state": shardings.opt_state_sharding,
+    }
+
+    offload_opt_state_sharding = None
+    if sharding.opt_state_offload:
+        offload_opt_state_sharding = jax.tree.map(lambda x: x.with_memory_kind("device"), shardings.opt_state_sharding)
+
+    @partial(jax.jit, out_shardings=train_shardings, **jit_kwargs)
+    def train_fn(params: Params, opt_state: OptState, teacher_params, *batch: Batch) -&gt; Dict[str, Any]:
+        logger.info("compiling train step fn ...")
+        with jax.named_scope("train_step"):
+            out = train_step(
+                single_step,
+                tx,
+                params,
+                opt_state,
+                batch,
+                teacher_params=teacher_params,
+                grad_steps=grad_steps,
+                reduce_fn=reduce_fn,
+                has_aux=has_aux,
+                offload_opt_state=offload_opt_state_sharding,
+            )
+            out["metrics"] = {f"train/{k}": v for k, v in out["metrics"].items()}
+            return out
+
+    @partial(jax.jit, out_shardings=shardings.metrics_sharding, **jit_kwargs)
+    def val_fn(params: Params, *batch: Batch) -&gt; Metrics:
+        logger.info("compiling val fn ...")
+        with jax.named_scope("val_step"):
+            val_metrics = val_step(
+                single_step,
+                params,
+                batch,
+                val_steps=val_steps,
+                has_aux=has_aux,
+            )
+            val_metrics = {f"val/{k}": v for k, v in val_metrics.items()}
+            return val_metrics
+
+    return train_fn, val_fn, shardings  # type: ignore</code></pre>
+
+      <p>
+        Finally, the <code>AsyncTrainWorker</code> can call the function above and receive the sharded train function that can be called with the RL batch data.
+      </p>
+
+      <pre><code class="language-python">self.train_fn, _val_fn, shardings = get_steps_fn(
+    ...
+    sharding=stax.ShardingConfig(
+        params_shape=params_shape,
+        opt_state_shape=opt_state_shape,
+        mesh_config=stax.MeshConfig(
+            dp=self.config.sharding_config.dp_group_size,
+            fsdp=self.config.sharding_config.fsdp_group_size,
+            cp_ulysses=self.config.sharding_config.cp_group_size,
+        ),
+        opt_state_offload=self.config.sharding_config.opt_state_offload,
+        min_bytes_for_fsdp=self.config.sharding_config.min_bytes_for_fsdp,
+        data_shard_dim=self.config.sharding_config.data_shard_dim,
+        cp_shard_dim=self.config.sharding_config.cp_shard_dim,
+        weight_shard_dim=self.config.sharding_config.weight_shard_dim,
+    ),
+)</code></pre>
+
+      <p>
+        The train step encompasses this whole sharding path into one function.
+      </p>
+
+      <pre><code class="language-python">def train_step(
+    self, params, opt_state, local_batch, teacher_params=None
+) -&gt; tuple[PyTree, PyTree, dict]:
+    with stax.Tracker(timer=True) as t:
+        global_batch = self.shard_data_fn(local_batch)
+        global_train_batch = jax.tree.map(
+            lambda x: rearrange(
+                x,
+                "(m g) ... -&gt; g m ...",
+                m=self.config.train_batch_size // self.config.grad_accum_steps,
+                g=self.config.grad_accum_steps,
+            ),  # [grad_accum_steps, minibatch_size, seq_len]
+            global_batch,
+        )
+
+        out = self.train_fn(params, opt_state, global_train_batch, teacher_params=teacher_params)
+
+        # we have to sync weights so might as well block to get true step time
+        jax.tree.map(lambda x: x.block_until_ready(), out)
+
+    metrics = out["metrics"] | {"train/learner_step_time": t.data["time"]}
+    return out["params"], out["opt_state"], metrics</code></pre>
+
+      <h3 id="loss-function">Loss Function</h3>
+
+      <p>
+        The final remaining component is the loss function. Since the get steps fn can take in any generic loss function, we give a simple example of the CISPO loss below <a class="cite" href="#ref-13">[13]</a>.
+      </p>
+
+      $$
+      \mathcal{L}_{\mathrm{CISPO}}(\theta) = -\mathbb{E}\left[ \frac{1}{\sum_{g=1}^{G} |y_g|} \sum_{i=1}^{G} \sum_{t=1}^{|y_i|} \mathrm{sg}\left(\min(r_{i,t}(\theta), \epsilon_{\mathrm{high}})\right) \cdot \hat{A}_{i} \cdot \log \pi_\theta(a_{i,t} \mid s_{i,t}) \right]
+      $$
+
+      <p>
+        Below is the implementation and it is assigned to the loss function above.
+      </p>
+
+      <pre><code class="language-python">class CISPOLoss(LossFunction):
+    name: str = "CISPO"
+
+    def __init__(self, loss_config: LossConfig, epsilon: float = 1.0):
+        super().__init__(loss_config)
+        self.epsilon = epsilon
+
+    def compute_advantage(self, batch: RLBatch, teacher_params: PyTree = None) -&gt; Array:
+        return batch.rewards - batch.group_mean
+
+    def compute_loss(
+        self, x_logprobs: Array, advantages: Array, batch: RLBatch, teacher_params: PyTree = None
+    ) -&gt; tuple[Array, dict[str, Array]]:
+        ratio = jnp.exp(x_logprobs - batch.reference_model_logprobs)
+        min_ratio = jax.lax.stop_gradient(jnp.minimum(ratio, self.epsilon))
+        token_loss = jnp.sum(advantages[:, None] * min_ratio * x_logprobs * batch.token_mask)
+        return token_loss, {}
+
+    def __call__(
+        self, model: Model, params: PyTree, batch: RLBatch, teacher_params=None, train: bool = True
+    ) -&gt; tuple[Array, PyTree]:
+        x_logprobs = model.get_logprobs(params, batch.tokens, batch.seq_lens)
+
+        batch = batch.replace(
+            tokens=batch.tokens[:, 1:],
+            reference_model_logprobs=batch.reference_model_logprobs[:, 1:],
+            token_mask=batch.token_mask[:, 1:],
+        )
+
+        advantages = self.compute_advantage(batch)
+        loss, aux_metrics = self.compute_loss(x_logprobs, advantages, batch, teacher_params)
+        loss *= -1  # gradient descent
+
+        ratio = jnp.exp(x_logprobs - batch.reference_model_logprobs)
+        # metrics will be reduced by compute_normalization function
+        aux_metrics |= {
+            "loss": loss,
+            "is_ratio": jnp.sum(ratio * batch.token_mask),
+        }
+
+        return loss, aux_metrics
+
+    @property
+    def compute_normalization(self) -&gt; Callable[[int | Array, PyTree], int | Array]:
+        return lambda denom, batch: denom + jnp.sum(batch.token_mask)</code></pre>
+
+      <h3 id="memory-optimization">Memory Optimization</h3>
+
+      <p>
+        Obtaining the logprobs for the target output tokens in a naive manner materializes the vocab dim for every prompt and time step resulting in a memory bottleneck. For example, in most Qwen models $V = 151{,}936$, so if $B = 512$ and $T = 4096$, in bf16 that amounts to a spike of ~637 GB. Since only the correct target token is needed, this is an unnecessary amount of memory for a very sparse use case. This can be done with a separate model call that accounts for a special fused linear selection kernel which takes the final hidden state <code>[B, T, D]</code> with the <code>lm_head</code> <code>[D, V]</code> and returns the intended logits. A custom VJP can be written so that we have explicit control over the materialization in the backwards pass as well.
+      </p>
+
+      <pre><code class="language-python">@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def fused_linear_selection(h, W, targets, chunk_size=1024) -&gt; Array:
+    return _fwd(h, W, targets, chunk_size)[0]</code></pre>
+
+      <p>
+        The hidden inputs arrive as a <code>[B * T, D]</code> tensor with the 0<sup>th</sup> dimension sharded over the whole mesh (DP, FSDP, CP_ULYSSES) and are reshaped into <code>[num_chunks, chunk_size, D]</code>. Since the scan loop uses the global shape, the sharding is transposed to the <code>chunk_size</code> dim using an all-to-all. Then, the gathered LM head is applied alongside softmax and the target logprobs are selected. The LM head is cast and applied in FP32 since this results in better stability <a class="cite" href="#ref-13">[13]</a>.
+      </p>
+
+      <pre><code class="language-python">def _fwd(h, W, targets, chunk_size):
+    B, D = h.shape
+    _, _V = W.shape
+    chunk_size = min(chunk_size, B)
+
+    num_chunks = make_chunks(B, chunk_size)
+    chunked_hidden_inputs = jax.lax.with_sharding_constraint(
+        h.reshape(num_chunks, chunk_size, D), P(None, (DP, FSDP, CP_ULYSSES), None)
+    )  # num_chunks, chunk_size, D
+    chunked_targets = jax.lax.with_sharding_constraint(
+        targets.reshape(num_chunks, chunk_size), P(None, (DP, FSDP, CP_ULYSSES))
+    )  # num_chunks, chunk_size
+
+    W_gather = jax.lax.with_sharding_constraint(W, P())
+
+    chunked_hidden_inputs, W_gather = jax.tree.map(lambda x: x.astype(jnp.float32), (chunked_hidden_inputs, W_gather))
+
+    def body_fn(carry, chunk):
+        hidden_chunk, target_chunk = chunk
+        logits_chunked = hidden_chunk @ W_gather  # chunk_size x V
+        log_softmax = jax.nn.log_softmax(logits_chunked, axis=-1)  # chunk_size x V
+        target_log_probs = jnp.take_along_axis(log_softmax, target_chunk[:, None], axis=-1)[:, 0]  # chunk_size
+
+        return carry, target_log_probs
+
+    _, chunked_output = jax.lax.scan(body_fn, None, (chunked_hidden_inputs, chunked_targets))  # num_chunks x chunk_size
+    output = chunked_output.reshape(B)  # (B,)
+    return output, (chunked_hidden_inputs, W_gather, chunked_targets)</code></pre>
+
+      <p>
+        The chunk logits are produced by $z_k = h_k W$, where $h_k \in \mathbb{R}^{C \times D}$, $W \in \mathbb{R}^{D \times V}$ and $z_k \in \mathbb{R}^{C \times V}$, with $C$ the chunk size, $D$ the hidden dimension and $V$ the vocab dim. With the custom VJP, we want the gradient of the loss with respect to the hidden states and LM head, $\frac{\partial L}{\partial h}$ and $\frac{\partial L}{\partial W}$. We use the notation $\partial x = \frac{\partial L}{\partial x}$. For every token $i$, the fused forward returns the log-softmax of the logits, $\ell_i = \log \text{softmax}(z_i)_{y_i} \in \mathbb{R}$. Since the cotangents $\partial \ell_i$ are given,
+      </p>
+
+      $$
+      \frac{\partial L}{\partial z_{i,j}} = \partial\ell_i \left( \mathbf{1}[j = y_i] - \frac{e^{z_{i,j}}}{\sum_{k=1}^{V} e^{z_{i,k}}} \right)
+      $$
+
+      <p>
+        The local gradients can be propagated such that $\partial h_k$ is chunk-local and $\partial W$ accumulates across chunks.
+      </p>
+
+      $$
+      \partial h_k = \partial z_k W^{\top}, \qquad \partial W = \sum_{k} h_k^{\top} \partial z_k
+      $$
+
+      <p>
+        From an implementation standpoint, the non-diff argument (in this case the chunk size), the residuals and the cotangents are passed into the backwards call. Similar to the forwards pass, the cotangents are reshaped and resharded (we save the chunked inputs, hence no need to repeat comms). During the backwards pass, the scan loop carries the hidden chunk, target chunk and cotangent chunk to compute the softmax. The final sharding to return to the original shardings of the inputs is handled by XLA.
+      </p>
+
+      <pre><code class="language-python">def _bwd(chunk_size, residuals, dy):
+    chunked_hidden_inputs, W_gather, chunked_targets = residuals
+    num_chunks, chunk_size, D = chunked_hidden_inputs.shape
+    _, V = W_gather.shape
+
+    chunked_dy = jax.lax.with_sharding_constraint(
+        dy.astype(jnp.float32).reshape(num_chunks, chunk_size), P(None, (DP, FSDP, CP_ULYSSES))
+    )
+
+    def body(dW, chunk):
+        hidden_chunk, target_chunk, dy_chunk = chunk
+        logits_chunked = hidden_chunk @ W_gather  # chunk_size x V
+
+        p = jax.nn.softmax(logits_chunked, axis=-1)  # chunk_size x V
+        onehot = jax.nn.one_hot(target_chunk, V, dtype=p.dtype)
+        dz = dy_chunk[:, None] * (onehot - p)  # chunk_size x V
+
+        dh_chunk = dz @ W_gather.T  # chunk_size x D
+        dW = dW + hidden_chunk.T @ dz  # D x V
+        return dW, dh_chunk
+
+    dW, chunked_dh = jax.lax.scan(
+        body,
+        jnp.zeros_like(W_gather, dtype=jnp.float32),
+        (chunked_hidden_inputs, chunked_targets, chunked_dy),
+    )
+
+    dh = chunked_dh.reshape(-1, D)  # (B, D)
+    d_targets = jnp.zeros((num_chunks * chunk_size), jax.dtypes.float0)
+    return dh, dW, d_targets
+
+fused_linear_selection.defvjp(_fwd, _bwd)</code></pre>
+
+      <figure>
+        <img src="images/fused_lm_head_1.png?v=2" style="max-width: min(100%, 680px);" alt="Memory profile of the unfused LM head implementation">
+        <figcaption>An unfused implementation for $B = 512$, $T = 512$, $V = 151{,}936$ results in a step time of 2.499s and peak data of 91.9 GB.</figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/fused_lm_head_2.png?v=2" style="max-width: min(100%, 680px);" alt="Memory profile of the fused chunked LM head implementation">
+        <figcaption>Performing this fused chunking with a chunk size of 8192 has a step time of 2.737s and peak data of 18.6 GB, an 80% peak reduction in memory.</figcaption>
+      </figure>
+
+      <h3 id="weight-sync">Weight Sync</h3>
+
+      <p>
+        Weight sync is the last part that connects the trainer back to the inference worker. In this case, our hosts are running separate programs, so a simple <code>jax.device_put(...)</code> will not work. JAX experimental ships with a transfer server supporting a push/pull API. A server can push some arrays waiting for a receiving client to pull the array off; however, this uses the DCN network which is not ideal considering we have TPUs on the same mesh.
+      </p>
+
+      <figure id="fig-rdma-transfer">
+        <img src="images/transfer_times.png?v=2" style="max-width: min(100%, 680px);" alt="DCN JAX transfer server times versus jax.device_put times">
+        <figcaption>DCN <a href="https://github.com/jax-ml/jax/blob/main/jax/experimental/transfer.py">JAX transfer server</a> times vs <code>jax.device_put</code> API times.</figcaption>
+      </figure>
+
+      <p>
+        Instead, we can write our own transfer server which will use cross-host device-puts to leverage the ICI connections. Since device-put requires the number of input and output devices to match, the server ensures that the number of train workers is a denominator of the total ranks and then will perform <code>n_hosts // train_workers</code> hops to transfer between hosts. For each hop, a mesh is created with the devices for the hop region.
+      </p>
+
+      <pre><code class="language-python">def create_mesh(devices: np.ndarray) -&gt; jax.sharding.Mesh:
+    assert devices.ndim == 1, "devices must be a 1-dimensional array"
+    return jax.make_mesh(
+        axis_shapes=(devices.size,), axis_names=("devices",), axis_types=(EXPLICIT,), devices=tuple(devices)
+    )
+
+class RDMATransferServer:
+    def __init__(self, train_workers: int):
+        assert 1 &lt;= train_workers &lt;= self.max_rank, f"expected 1 &lt;= train_workers &lt;= {self.max_rank}"
+        assert self.max_rank % train_workers == 0, (
+            f"expected train workers to divide total workers, got {self.max_rank} and {train_workers}"
+        )
+
+        self.train_workers = train_workers
+        self.n_slots = self.max_rank // train_workers
+        self.slot_size = train_workers * jax.local_device_count()
+
+        devices = np.array(jax.devices())
+        self.meshes = [create_mesh(devices[j * self.slot_size : (j + 1) * self.slot_size]) for j in range(self.n_slots)]
+
+    @cached_property
+    def max_rank(self) -&gt; int:
+        return jax.process_count()
+
+    @cached_property
+    def rank(self) -&gt; int:
+        return jax.process_index()
+
+    @cached_property
+    def slot(self) -&gt; int:
+        return self.rank // self.train_workers</code></pre>
+
+      <p>
+        To write the transfer method, we first keep a PyTree on all hosts with the same shape and dtype (inference workers can still randomly initialize weights of the model). The 0<sup>th</sup> slot (which is a train worker) will transfer the tree to the 1D sharding. Then, the meshes are zipped one off to transfer between each other. An empty buffer description is made using the single-device API by passing an empty list of array references. If the slot is on the receiving mesh, it saves the tree as the output since it receives the materialized arrays. Even though this is linear in the number of hops (compared to a tree reduction which is $\log_2 n$), since the device put API is asynchronous, all operations are enqueued and pipelined. Hence afterwards, each host blocks and returns an identical materialized PyTree.
+      </p>
+
+      <pre><code class="language-python">def allocate_buffer(shapes: PyTree, sharding: jax.NamedSharding):
+    return jax.tree.map(
+        lambda s: jax.make_array_from_single_device_arrays(s.shape, sharding=sharding, arrays=[], dtype=s.dtype), shapes
+    )
+
+def get_default_sharding(mesh: jax.sharding.Mesh) -&gt; jax.NamedSharding:
+    return jax.NamedSharding(mesh, jax.P())
+
+class RDMATransferServer:
+    ...
+
+    def transfer(self, tree: PyTree) -&gt; PyTree:
+        mh.sync_global_devices("rdma_transfer_start")
+        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree)
+        shardings = list(map(get_default_sharding, self.meshes))
+
+        if self.slot == 0:
+            tree = jax.device_put(tree, shardings[0])
+
+        for i, (src, dest) in enumerate(itertools.pairwise(shardings)):
+            buffer = tree if self.slot == i else allocate_buffer(shapes, src)
+            out = jax.device_put(buffer, dest)
+            if self.slot == i + 1:
+                tree = out
+
+        tree = jax.tree.map(lambda x: x.block_until_ready(), tree)
+        mh.sync_global_devices("rdma_transfer_end")
+        return tree</code></pre>
+
+      <p>
+        The key point to note is that the benefit of the pipelining is seen with more leaves in the PyTree since more sends can be overlapped. This can be observed on a trace based on the blocking of each host.
+      </p>
+
+      <figure>
+        <img src="images/pipeline_transfers.png?v=2" style="max-width: min(100%, 820px);" alt="Trace showing pipelined weight transfers across hosts">
+        <figcaption>Profile of RDMA transfer with a 10 GB PyTree of 8 leaves across <code>TPU-v5p-32</code> (4 hosts) with 4 hops.</figcaption>
+      </figure>
+
+      <p>
+        In the trainer, the weight sync queue is first used as a barrier (since JAX multi-host barrier syncs have a timeout). The weights are cast before sending and then the <code>rdma_server</code> transfer API is used.
+      </p>
+
+      <pre><code class="language-python">class AsyncTrainWorker(Worker):
+    ...
+
+    def _init_state(self):
+        self.rdma_server = RDMATransferServer(train_workers=self.config.async_config.train_workers)
+
+    def train_sync_weights(self):
+        assert self.train_mesh is not None, "Train mesh must be set up to sync weights."
+
+        with stax.Tracker(timer=True) as t:
+            params_cast = jax.tree.map(
+                lambda p: p.astype(self.config.loss_config.inference_config.params_dtype), self.params
+            )
+            if self.worker_rank == 0:
+                for _ in range(self.async_options.inference_workers):
+                    self.async_options.queues.weight_sync_queue.put("sync")
+
+            _ = self.rdma_server.transfer({"params": params_cast})
+
+            del params_cast
+
+        self.weight_iteration += 1
+        self.log_info(f"[weight_sync] Weights sent to inference worker in {t.data['time']:.2f} seconds")
+        return {"train/weight_sync_time": t.data["time"]}</code></pre>
+
+      <p>
+        Receiving the transferred weights is a bit more tricky since each thread is enqueuing its own operations and there needs to be a head to coordinate the transfer. For this, the <code>AsyncInferenceWorker</code>, alongside launching each replica, will keep a background check that checks for the weight transfer.
+      </p>
+
+      <pre><code class="language-python">class AsyncInferenceWorker(Worker):
+    def __init__(self, trainer_config: TrainerConfig, async_options: AsyncOptions):
+        ...
+
+        self.transfer_server = RDMATransferServer(train_workers=self.async_options.train_workers)
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_weight_sync, args=(self.async_state, self.async_options), daemon=True
+        )
+        self.monitor_thread.start()
+        ...
+
+    def monitor_weight_sync(self, async_state: AsyncState, async_options: AsyncOptions):
+        while True:
+            # blocks until the train worker puts a message
+            _ = async_options.queues.weight_sync_queue.get()
+
+            logger.info(
+                f"[weight_sync] Rank {jax.process_index()} received sync signal from train worker, syncing weights to latest parameters...",
+                log_for_all=True,
+            )
+
+            ...</code></pre>
+
+      <p>
+        To start, a default strategy is to keep one set of params for each async inference worker and instantiate each of its replicas with a reference to that copy. Then the inference worker's params can be updated with the transfer server and whenever each replica is finished decoding, it can independently update its local copy with the synced params from the reference. However, this leads to problems with scaling model size as it requires doubling the amount of memory than what is required. A separate solution involves gating the weight sync until all threads have finished decoding a sequence. Then, each thread can create a separate JAX array referencing the same underlying PJRT buffer of the sharded weights resulting in no additional movement of the weights. This approach is described below.
+      </p>
+
+      <p>
+        A function called <code>maybe_update_params</code> is added to each worker.
+      </p>
+
+      <pre><code class="language-python">class SingleInferenceReplica:
+    ...
+
+    def _maybe_update_params(self):
+        ...</code></pre>
+
+      <p>
+        Inside the monitor weight sync, first the signal from the trainer is popped. A threading condition can be used to count the number of ready workers, which is set to 0 at the start of the sync. Then an event can be set to indicate to the replicas that a weight sync will occur. The replicas will then increment the condition count and the main thread is blocked until the number of workers ready is equal to the number of replicas.
+      </p>
+
+      <p>
+        On the replica side, after the event is cleared, the lock can be used to read the newly updated params. Each replica indexes the shards for the devices in its sharding to create a JAX array with its own abstract value (aval), but references the same underlying PJRT buffer from the main thread to avoid the local copy.
+      </p>
+
+      <p>
+        Once the local weights reference is updated, the worker can return to the decode loop. Since the decode loop stopped with an in-flight batch, the rest of the batch continues to roll out with the new weights. Although in theory the previous KV cache is from a different model, in practice this does not seem to make a difference <a class="cite" href="#ref-2">[2</a>, <a class="cite" href="#ref-15">15]</a>.
+      </p>
+
+      <pre><code class="language-python">class SingleInferenceReplica:
+    ...
+
+    def continuous_batch(
+        self, prefill_prompts: InferenceState, state: InferenceState | None
+    ) -&gt; tuple[InferenceState, dict[str, float]]:
+        ...
+        with Tracker(timer=True) as t:
+            ...
+            while len(prompt_queue) &gt; 0:
+                ...
+                self._maybe_update_params()
+
+        ...
+        return state, decode_metrics
+
+    def _maybe_update_params(self):
+        # check if weight sync event has been triggered
+        if not self.async_state.weight_sync_event.is_set():
+            return
+
+        # tell main thread this replica is ready
+        with self.async_state.n_workers_condition:
+            self.async_state.n_workers_ready += 1
+            self.async_state.n_workers_condition.notify_all()
+
+        # wait for transfer to be received, params updated and event is cleared
+        while self.async_state.weight_sync_event.is_set():
+            time.sleep(0.1)
+
+        # read the weights and make a new reference to the same buffer
+        with self.async_state.read_write_lock:
+            assert self.weight_iteration &lt; self.async_state.weight_iteration, (
+                "expected new weight iteration to be greater than current weight iteration"
+            )
+            self.params = jax.tree.map(
+                lambda x: jax.make_array_from_single_device_arrays(
+                    x.shape,
+                    self.sharding,
+                    arrays=[s.data for s in x.addressable_shards if s.device in self.devices],
+                    dtype=x.dtype,
+                ),
+                self.async_state.MRUparams,
+            )
+            self.weight_iteration = self.async_state.weight_iteration
+
+        logger.info(f"Params updated on inference worker {self.global_worker_id}", log_for_all=True)
+
+
+class AsyncInferenceWorker(Worker):
+    ...
+
+    def monitor_weight_sync(self, async_state: AsyncState, async_options: AsyncOptions):
+        while True:
+            # receive signal from train worker
+            _ = async_options.queues.weight_sync_queue.get()
+
+            logger.info(
+                f"[weight_sync] Rank {jax.process_index()} received sync signal from train worker, syncing weights to latest parameters...",
+                log_for_all=True,
+            )
+
+            # zero out ready workers
+            # trigger event
+            # wait for workers to say they're ready
+            with async_state.n_workers_condition:
+                async_state.n_workers_ready = 0
+                async_state.weight_sync_event.set()
+                async_state.n_workers_condition.wait_for(lambda: async_state.n_workers_ready &gt;= self.n_replicas, timeout=60)
+                if async_state.n_workers_ready &lt; self.n_replicas:
+                    logger.warning(f"Got {async_state.n_workers_ready} signals, expected {self.n_replicas}")
+
+            # delete old weights to free memory
+            # update MRU params with transfer server API
+            # increment weight iteration
+            shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), async_state.MRUparams)
+            with async_state.read_write_lock:
+                jax.tree.map(lambda x: x.delete(), async_state.MRUparams)
+                async_state.MRUparams = self.transfer_server.transfer(shapes)
+                async_state.weight_iteration += 1
+
+            async_state.weight_sync_event.clear()</code></pre>
+
+      <figure>
+        <img src="images/pjrt_buffer.png?v=2" style="max-width: min(100%, 680px);" alt="Replica arrays referencing the same underlying PJRT buffer as the main thread's params">
+        <figcaption><code>jax.make_array_from_single_device_arrays(...)</code> lets us reference the same array that the main thread updates whilst avoiding the copy to a new region of memory.</figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/weight_sync_times.png?v=2" style="max-width: min(100%, 680px);" alt="Llama 8B weight transfer times per sync">
+        <figcaption>Llama 8B bf16 weight transfer time averages ~1.25s<sup class="fn" id="fnref-6"><a href="#fn-6">6</a></sup>.</figcaption>
+      </figure>
+
+      <h3 id="roofline-analysis">Roofline Analysis</h3>
+
+      <p>
+        A quick roofline analysis can be used to determine how to optimally partition the train and inference workers. Let $A$ be the total chips and $X$ be the number of chips that are used for training. Assuming the token batch size will be greater than 2550<sup class="fn" id="fnref-7"><a href="#fn-7">7</a></sup> and only FSDP is used, the train step time can then be assumed to be compute bound. Hence
+      </p>
+
+      $$
+      T_{\text{train}} = \frac{6BTP}{XC}
+      $$
+
+      <p>
+        where $B$ is batch size, $T$ is sequence length, $P$ is number of parameters and $C$ is the compute throughput of the chip. For inference, the majority of the time is spent in the decode step so prefill can be ignored. For decode, the per single-decode step time is memory bound so the inference step time can be modelled as
+      </p>
+
+      $$
+      T_{\text{inference step time}} = \frac{B_d T K + 2P}{M}
+      $$
+
+      <p>
+        where $B_d$ is equal to the in-flight batch size and $K$ is the KV cache size per token. Then assuming the sequence rolls out to a $\lambda$ fraction of the total sequence length, the step time for an in-flight batch is
+      </p>
+
+      $$
+      T_{\text{inference batch time}} = \lambda T \cdot T_{\text{inference step time}}
+      $$
+
+      <p>
+        For one batch of completions, this will be repeated $\frac{B}{B_d(A-X)}$ times since each inference device rolls out in parallel. Taking this into account, the total inference time is
+      </p>
+
+      $$
+      T_{\text{inference}} = \frac{\lambda T \cdot T_{\text{inference step time}} \cdot B}{B_d(A-X)}
+      $$
+
+      <p>
+        Since the trainer shouldn't be stalling on a batch, the condition $T_\text{inference} \le T_{\text{train}}$ should be satisfied. Similarly, we can reason $T_{\text{inference}} \ge T_{\text{train}}$ as if the inference is faster than the trainer then at some point samples will have to be filtered out. This implies the condition $T_{\text{train}} = T_{\text{inference}}$. If we set $\alpha = \frac{6BTP}{C}$ which is the total train time across all chips and $\beta = \frac{\lambda BT(KB_dT+2P)}{MB_d}$ is the total decode time across all chips then let
+      </p>
+
+      $$
+      r = \frac{\beta}{\alpha}
+      = \frac{\lambda C}{M} \cdot \frac{K B_d T + 2P}{6 P B_d}
+      = \frac{\lambda C}{6M} \left( \frac{K T}{P} + \frac{2}{B_d} \right).
+      $$
+
+      <p>
+        Solving for $\frac{X}{A}$, which is the percentage of chips used for training, yields
+      </p>
+
+      $$
+      \frac{X}{A} = \frac{1}{1+r}
+      $$
+
+      <p>
+        We can plug this in to estimate for Llama 8B, 4096 sequence length on 32 TPU v5p so we have
+      </p>
+
+      $$
+      \begin{align*}
+      C   &= 459 \times 10^{12} \\
+      M   &= 2765 \times 10^{9} \\
+      T   &= 4096 \\
+      A   &= 32 \\
+      K   &= 4 \cdot 32 \cdot 8 \cdot 128 = 131 \times 10^{3} \\
+      P   &= 8 \times 10^{9} \\
+      B_d &= 44 \\
+      k   &= 8 \\
+      \lambda &= 0.5
+      \end{align*}
+      $$
+
+      <p>
+        solving we obtain $r \approx 1.5$ and the optimal allocation for the train to inference chips is roughly 40%.
+        There are a few assumptions in this model such as every decode step has to load the whole cache<sup class="fn" id="fnref-8"><a href="#fn-8">8</a></sup> and that the
+        mean sequence length is used but in reality, we are stalled by the tail of the generation distribution.
+        Regardless, a simple roofline analysis like this gives us a good starting point in how we should think about
+        allocating our compute<sup class="fn" id="fnref-9"><a href="#fn-9">9</a></sup>. For example if we optimize the memory required by the inference chips and load a larger
+        $B_d$, this analysis would suggest to dedicate more chips to training and vice versa.
+      </p>
+
+      <h2 id="results">Results</h2>
+
+      <p>
+        Below we report results for Qwen3 1.7B, 4B and 8B base models and Llama 3.1 8B Instruct training on math RLVR using a subset of DAPO-Math-17k and evaluated on MATH-500, AMC 25, AIME 25 and AIME 26 with sequence length 4096. We trained for up to 1000 steps on a <code>TPU-v5p-64</code> (32 chips), split 50/50 for train and inference. For the Qwen models, we use CISPO with an lr of 1e-6 and for Llama we noticed instabilities with CISPO due to no lower-bound clipping and hence switched to Dr. GRPO with $\epsilon_{\text{low}}$ of 0.2, $\epsilon_{\text{high}}$ of 0.28 and an lr of 4e-7 <a class="cite" href="#ref-14">[14]</a>. The model parameters and optimizer state are kept in fp32 and inference is done with bf16 weights.
+      </p>
+
+      <figure class="grid-2col">
+        <div>
+          <img src="images/results/llama8b/math_500_avg_at_8.png?v=3" alt="avg@8 on MATH-500">
+          <img src="images/results/llama8b/amc_25_avg_at_8.png?v=3" alt="avg@8 on AMC 25">
+          <img src="images/results/llama8b/aime_2025_avg_at_8.png?v=3" alt="avg@8 on AIME 25">
+          <img src="images/results/llama8b/aime_2026_avg_at_8.png?v=3" alt="avg@8 on AIME 26">
+          <img src="images/results/llama8b/math_500_pass_at_32.png?v=3" alt="pass@32 on MATH-500">
+          <img src="images/results/llama8b/amc_25_pass_at_32.png?v=3" alt="pass@32 on AMC 25">
+          <img src="images/results/llama8b/aime_2025_pass_at_32.png?v=3" alt="pass@32 on AIME 25">
+          <img src="images/results/llama8b/aime_2026_pass_at_32.png?v=3" alt="pass@32 on AIME 26">
+          <img src="images/results/llama8b/mean_reward.png?v=3" alt="mean training reward">
+          <img src="images/results/llama8b/seq_len.png?v=3" alt="mean and median rollout length">
+          <img src="images/results/llama8b/is_ratio.png?v=3" alt="importance sampling ratio">
+          <img src="images/results/llama8b/total_step_time.png?v=3" alt="total trainer step time">
+          <img src="images/results/llama8b/rollout_wait_time.png?v=3" alt="time the trainer spent waiting on the rollout queue">
+          <img src="images/results/llama8b/weight_sync_time.png?v=3" alt="weight sync time">
+          <img src="images/results/llama8b/tps.png?v=3" alt="inference decode tokens per second (single worker, 16 total workers)">
+        </div>
+        <figcaption>Qwen3 1.7B, 4B and 8B base and Llama 3.1 8B Instruct on math RLVR. From top to bottom, left to right: avg@8 on MATH-500; avg@8 on AMC 25; avg@8 on AIME 25; avg@8 on AIME 26; pass@32 on MATH-500; pass@32 on AMC 25; pass@32 on AIME 25; pass@32 on AIME 26; mean training reward; mean and median rollout length; importance sampling ratio; total trainer step time; time the trainer spent waiting on the rollout queue; weight sync time; inference decode tokens per second (single worker, 16 total workers).</figcaption>
+      </figure>
+
+      <h2 id="conclusion">Conclusion</h2>
+
+      <p>
+        We present an Async RL stack in pure JAX targeted towards quick research iteration. We covered the core parts of the stack alongside the unique challenges that are presented when choosing JAX as our framework for implementation. If any of this excites you, feel free to <a href="https://x.com/_DivyaMakkar">reach out</a>!
+      </p>
+
+      <h2 id="acknowledgements">Acknowledgements</h2>
+
+      <p>
+        Thank you to Zak and the TRC program for the compute, <a href="https://x.com/chinmayjindal_">Chinmay Jindal</a> for contributing to the stack alongside proofreading early versions of this blog and <a href="https://x.com/_williamzeng">William Zeng</a> for helping with the <a href="https://github.com/adityamakkar000/mesh">infrastructure tooling</a> which saved countless TPU hours.
+      </p>
+
+      <div class="footnotes">
+        <h2>Notes</h2>
+        <ol>
+          <li id="fn-1">
+            In fact, it won <a href="https://icml.cc/virtual/2026/awards_detail">ICML 2026's test of time award</a>. However, its main contribution was more so stabilizing deep RL methods by allowing for more exploration, which is in contrast to today where async RL methods notoriously add more instabilities. <a class="fn-back" href="#fnref-1" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-2">
+            Although the name suggests 32, v5p TPUs have 2 cores, hence this is a total of 16 chips. <a class="fn-back" href="#fnref-2" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-3">
+            Other than just partitioning the devices, these meshes allow us to perform functions over a subset of the hosts. For instance, JAX provides <a href="https://github.com/jax-ml/jax/blob/main/jax/experimental/multihost_utils.py">multi-host utils</a> such as barriers to sync devices, however in our case, we may want to sync a subset of our hosts, hence we can monkey patch the multi-host utils to take in either our train or inference meshes.
+            <pre><code class="language-python">def sync_over_mesh(name: str, mesh: jax.sharding.Mesh | None = None):
+
+    # if a mesh is provided, sync only the hosts in that mesh; otherwise, use the default route
+    h = np.uint32(zlib.crc32(name.encode()))
+    assert_equal(h, mesh, f"sync_global_devices name mismatch ('{name}')")</code></pre>
+            <a class="fn-back" href="#fnref-3" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-4">
+            SGLang supports TPU v6e and v7, however the majority of our training is on v5p. <a class="fn-back" href="#fnref-4" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-5">
+            Hop latencies are around 1 microsecond, so on a v5p with 1200 GB/s bidirectional ICI bandwidth that corresponds to ~1 MB. For more info see the <a href="https://jax-ml.github.io/scaling-book/sharding/#case-2-one-multiplicand-has-a-sharded-contracting-dimension">scaling book</a>. <a class="fn-back" href="#fnref-5" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-6">
+            Although the ICI bandwidth per chip is 600 GB/s, looking at the <a href="#fig-rdma-transfer">measurements from above</a>, we achieve 70 GB/s (overhead of the cross-host device puts). Looking at the Llama weight transfer times we achieve 38.4 GB/s due to additional overheads (e.g. queue-based sync, threading syncs, multi-host syncs in the RDMA server, etc.). <a class="fn-back" href="#fnref-6" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-7">
+            Our mesh used to train the 4096 sequence length models is a <code>TPU-v5p-64</code> (32 chips), so the topology is 2&times;4&times;4. Since we split our hosts, we cannot use bidirectional comms, so our $W_{\text{ici}}$ is 2&times; slower, but we can still have a 2D mesh with FSDP over it, so the factor of 2 cancels out. Hence we are roughly bound at the 2550 token count. For further info see the <a href="https://jax-ml.github.io/scaling-book/training/#fully-sharded-data-parallelism-fsdp">scaling book</a>. <a class="fn-back" href="#fnref-7" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-8">
+            Specialized kernels can be used to avoid loading the whole KV cache such as <a href="https://arxiv.org/abs/2604.15464">Ragged Page Attention</a>. <a class="fn-back" href="#fnref-8" title="Back to text">&#8617;</a>
+          </li>
+          <li id="fn-9">
+            This analysis is of a steady state and hence the off-policyness or lag $k$ doesn't impact our model. The core question is how can we efficiently partition our chips to maximize useful compute. If the inference engine is faster than the trainer then at some point some samples will be thrown out / wasted and hence it is better to dedicate more chips to the trainer to decrease step time. The addition of $k$ is useful when your compute is fixed and you want to understand how off-policy you should be such that your trainer is not stalling for examples. For more information on this sort of analysis, <a href="https://luk-huang.github.io/personal-website/blog/is-frontier-asynchronous-rl-solved.html#staleness-problem">this blog</a> explains it well! <a class="fn-back" href="#fnref-9" title="Back to text">&#8617;</a>
+          </li>
+        </ol>
+      </div>
+
+      <div class="references">
+        <h2>References</h2>
+        <ol>
+          <li id="ref-1">
+            DeepSeek-AI (2025). <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</a>. arXiv:2501.12948.
+          </li>
+          <li id="ref-2">
+            Pich&eacute;, A., Kamalloo, E., Pardinas, R., Chen, X. and Bahdanau, D. (2025). <a href="https://arxiv.org/abs/2509.19128">PipelineRL: Faster On-policy Reinforcement Learning for Long Sequence Generation</a>. arXiv:2509.19128.
+          </li>
+          <li id="ref-3">
+            Austin, J., Douglas, S., Frostig, R., Levskaya, A., Chen, C., Vikram, S., Lebron, F., Choy, P., Ramasesh, V., Webson, A. and Pope, R. (2025). <a href="https://jax-ml.github.io/scaling-book/">How to Scale Your Model</a>. Google DeepMind.
+          </li>
+          <li id="ref-4">
+            Tazi, N., Mom, F., Zhao, H., Nguyen, P., Mekkouri, M., von Werra, L. and Wolf, T. (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a>. Hugging Face.
+          </li>
+          <li id="ref-5">
+            Dirhoussi, A., Gallou&eacute;dec, Q., Rasul, K., Tunstall, L., Beeching, E., Villanova del Moral, A., Tazi, N., von Werra, L. and Paniego, S. (2026). <a href="https://huggingface.co/blog/async-rl-training-landscape">Keep the Tokens Flowing: Lessons from 16 Open-Source RL Libraries</a>. Hugging Face Blog.
+          </li>
+          <li id="ref-6">
+            Fireworks AI (2026). <a href="https://fireworks.ai/blog/frontier-rl-is-cheaper-than-you-think">Frontier RL Is Cheaper Than You Think</a>. Fireworks AI Blog.
+          </li>
+          <li id="ref-7">
+            Cursor Research (2026). <a href="https://arxiv.org/abs/2603.24477">Composer 2 Technical Report</a>. arXiv:2603.24477.
+          </li>
+          <li id="ref-8">
+            Khatri, D., Madaan, L., Tiwari, R., Bansal, R., Duvvuri, S. S., Zaheer, M. et al. (2025). <a href="https://arxiv.org/abs/2510.13786">The Art of Scaling Reinforcement Learning Compute for LLMs</a>. arXiv:2510.13786.
+          </li>
+          <li id="ref-9">
+            GLM-V Team (2025). <a href="https://arxiv.org/abs/2507.01006">GLM-4.5V and GLM-4.1V-Thinking: Towards Versatile Multimodal Reasoning with Scalable Reinforcement Learning</a>. arXiv:2507.01006.
+          </li>
+          <li id="ref-10">
+            Qwen Team (2025). <a href="https://arxiv.org/abs/2505.09388">Qwen3 Technical Report</a>. arXiv:2505.09388.
+          </li>
+          <li id="ref-11">
+            Miles Team (2026). <a href="https://www.lmsys.org/blog/2026-05-13-no-token-left-behind/">No Token Left Behind: Demystifying Token-In-Token-Out in Miles</a>. LMSYS Org Blog.
+          </li>
+          <li id="ref-12">
+            Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., Zuo, X., Yue, Y. et al. (2025). <a href="https://arxiv.org/abs/2503.14476">DAPO: An Open-Source LLM Reinforcement Learning System at Scale</a>. arXiv:2503.14476.
+          </li>
+          <li id="ref-13">
+            MiniMax (2025). <a href="https://arxiv.org/abs/2506.13585">MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</a>. arXiv:2506.13585.
+          </li>
+          <li id="ref-14">
+            Liu, Z., Chen, C., Li, W., Qi, P., Pang, T., Du, C., Lee, W. S. and Lin, M. (2025). <a href="https://arxiv.org/abs/2503.20783">Understanding R1-Zero-Like Training: A Critical Perspective</a>. arXiv:2503.20783.
+          </li>
+          <li id="ref-15">
+            Mistral AI (2025). <a href="https://arxiv.org/abs/2506.10910">Magistral</a>. arXiv:2506.10910.
+          </li>
+        </ol>
+      </div>
+
+    </div>
+
+    </div>
+    <div id="right"></div>
+  </div>
+
+  <script>
+    document.querySelectorAll("nav a").forEach(function (link) {
+      if (link.getAttribute("href") === "more.html") link.classList.add("active");
+    });
+    document.querySelectorAll("a[href^='http']").forEach(function (link) {
+      if (link.hostname !== window.location.hostname) {
+        link.setAttribute("target", "_blank");
+        link.setAttribute("rel", "noopener");
+      }
+    });
+  </script>
+</body>
+</html>
